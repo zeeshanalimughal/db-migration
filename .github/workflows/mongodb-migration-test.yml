@@ -1,0 +1,110 @@
+name: MongoDB 7.0 -> 8.3 migration test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mongodb-migration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  migrate:
+    # Same OS as production (Ubuntu 22.04 jammy, x86_64, systemd).
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    env:
+      SOURCE_VERSION: "7.0.42"
+      TARGET_VERSION: "8.3.4"
+      INTERMEDIATE_VERSION: "8.0.34"
+      MONGOT_VERSION: "1.78.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate credentials (masked)
+        run: |
+          ADMIN_PW="$(openssl rand -hex 24)"
+          echo "::add-mask::$ADMIN_PW"
+          echo "ADMIN_PW=$ADMIN_PW" >> "$GITHUB_ENV"
+          echo "MONGO_URI=mongodb://admin:${ADMIN_PW}@127.0.0.1:27017/workmentor?authSource=admin&replicaSet=rs0" >> "$GITHUB_ENV"
+
+      - name: Lint shell scripts
+        run: |
+          bash -n scripts/migrate-mongodb.sh ci/setup-source-mongodb.sh
+          shellcheck -S error scripts/migrate-mongodb.sh ci/setup-source-mongodb.sh
+
+      - name: Provision production-like MongoDB ${{ env.SOURCE_VERSION }} (replica set + keyfile + auth)
+        run: sudo -E bash ci/setup-source-mongodb.sh
+
+      - name: Wrong password is rejected
+        run: |
+          if mongosh --quiet "mongodb://admin:wrong@127.0.0.1:27017/admin?replicaSet=rs0" --eval 'db.runCommand({ping:1})' 2>/dev/null; then
+            echo "::error::login with a wrong password succeeded"; exit 1
+          fi
+          echo "OK authentication is enforced"
+
+      - name: Seed the workmentor database
+        run: mongosh --quiet "$MONGO_URI" ci/seed.js
+
+      - name: Query BEFORE migration
+        run: mongosh --quiet "$MONGO_URI" ci/query.js
+
+      - name: Run the migration script
+        run: sudo -E env ASSUME_YES=1 STRICT_COUNTS=1 bash scripts/migrate-mongodb.sh
+
+      - name: Query AFTER migration
+        run: mongosh --quiet "$MONGO_URI" ci/query.js
+
+      - name: Verify version, data, auth and $vectorSearch
+        run: |
+          EXPECT_VERSION="$TARGET_VERSION" mongosh --quiet "$MONGO_URI" ci/verify-after.js
+          if mongosh --quiet "mongodb://127.0.0.1:27017/?directConnection=true" --eval 'db.adminCommand({listDatabases:1}).ok' 2>/dev/null | grep -qx 1; then
+            echo "::error::auth no longer enforced after migration"; exit 1
+          fi
+          grep -q 'cursorTimeoutMillis: 600000' /etc/mongod.conf
+          python3 -c 'import yaml; c=yaml.safe_load(open("/etc/mongod.conf")); print("mongod.conf setParameter:", c["setParameter"])'
+          systemctl is-enabled mongod mongot
+          apt-mark showhold | grep mongodb-org
+
+      - name: Restore test (backup archive is usable)
+        run: |
+          ARCHIVE="$(sudo bash -c 'ls -1t /var/backups/mongodb-migration/*/dump/full-backup.archive.gz | head -1')"
+          sudo bash -c "cd \$(dirname '$ARCHIVE') && sha256sum -c full-backup.archive.gz.sha256"
+          sudo cat "$ARCHIVE" | mongorestore --uri "$MONGO_URI" --gzip --archive \
+            --nsInclude 'workmentor.*' --nsFrom 'workmentor.*' --nsTo 'restorecheck.*'
+          mongosh --quiet "$MONGO_URI" --eval '
+            const a = db.getSiblingDB("workmentor"), b = db.getSiblingDB("restorecheck");
+            for (const c of a.getCollectionNames()) {
+              const x = a.getCollection(c).countDocuments(), y = b.getCollection(c).countDocuments();
+              print(`${c}: live=${x} restored=${y}`);
+              if (x !== y) quit(1);
+            }
+            b.dropDatabase();'
+
+      - name: Re-run is safe (idempotent, verify-only)
+        run: |
+          sudo -E env ASSUME_YES=1 STRICT_COUNTS=1 bash scripts/migrate-mongodb.sh | tee rerun.log
+          grep -q "mongot already installed" rerun.log
+          ! grep -q "3. Backup" rerun.log
+
+      - name: Collect logs
+        if: always()
+        run: |
+          mkdir -p ci-logs
+          sudo bash -c 'for d in /var/backups/mongodb-migration/*/; do n=$(basename "$d"); mkdir -p ci-logs/$n; cp "$d"/*.log "$d"/*.json "$d"/*.tsv "$d"/RESTORE.txt ci-logs/$n/ 2>/dev/null; cp "$d"/dump/*.log ci-logs/$n/ 2>/dev/null; done; true'
+          sudo cp /var/log/mongodb/mongod.log ci-logs/ 2>/dev/null || true
+          sudo journalctl -u mongot --no-pager > ci-logs/mongot.journal.log 2>/dev/null || true
+          sudo journalctl -u mongod --no-pager > ci-logs/mongod.journal.log 2>/dev/null || true
+          sudo chown -R "$USER" ci-logs
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: migration-logs
+          path: ci-logs
+          retention-days: 7
