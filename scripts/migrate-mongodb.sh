@@ -159,10 +159,27 @@ js_try() { js "$1" 2>/dev/null || true; }
 
 # A mongodump/mongorestore config file holding the URI, readable by root only.
 TOOLS_CFG=""
+
+# mongodump treats a database in the URI path as --db, and --oplog only works
+# on a full dump. Strip the path; when it was also the implicit auth database
+# (no authSource option), carry it over as authSource so login still works.
+tools_uri() {
+  local uri="$1" scheme rest hosts tail db="" opts=""
+  scheme="${uri%%://*}"; rest="${uri#*://}"
+  hosts="${rest%%[/?]*}"; tail="${rest:${#hosts}}"
+  if [[ "$tail" == /* ]]; then tail="${tail#/}"; db="${tail%%\?*}"; fi
+  [[ "$tail" == *\?* ]] && opts="${tail#*\?}"
+  if [[ -n "$db" && ! "$opts" =~ (^|&)authSource= ]]; then
+    opts="${opts:+$opts&}authSource=$db"
+  fi
+  printf '%s://%s/%s\n' "$scheme" "$hosts" "${opts:+?$opts}"
+}
+
 write_tools_cfg() {
   TOOLS_CFG="$TMP_DIR/tools.yaml"
+  local turi; turi="$(tools_uri "$MIG_URI")"
   # YAML single-quoted scalar: escape single quotes by doubling them.
-  printf "uri: '%s'\n" "${MIG_URI//\'/\'\'}" > "$TOOLS_CFG"
+  printf "uri: '%s'\n" "${turi//\'/\'\'}" > "$TOOLS_CFG"
   chmod 600 "$TOOLS_CFG"
 }
 

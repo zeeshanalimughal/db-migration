@@ -31,6 +31,8 @@ jobs:
           echo "::add-mask::$ADMIN_PW"
           echo "ADMIN_PW=$ADMIN_PW" >> "$GITHUB_ENV"
           echo "MONGO_URI=mongodb://admin:${ADMIN_PW}@127.0.0.1:27017/workmentor?authSource=admin&replicaSet=rs0" >> "$GITHUB_ENV"
+          # Same login without a database path, for mongorestore (a path would act as --db).
+          echo "TOOLS_URI=mongodb://admin:${ADMIN_PW}@127.0.0.1:27017/?authSource=admin&replicaSet=rs0" >> "$GITHUB_ENV"
 
       - name: Lint shell scripts
         run: |
@@ -74,7 +76,7 @@ jobs:
         run: |
           ARCHIVE="$(sudo bash -c 'ls -1t /var/backups/mongodb-migration/*/dump/full-backup.archive.gz | head -1')"
           sudo bash -c "cd \$(dirname '$ARCHIVE') && sha256sum -c full-backup.archive.gz.sha256"
-          sudo cat "$ARCHIVE" | mongorestore --uri "$MONGO_URI" --gzip --archive \
+          sudo cat "$ARCHIVE" | mongorestore --uri "$TOOLS_URI" --gzip --archive \
             --nsInclude 'workmentor.*' --nsFrom 'workmentor.*' --nsTo 'restorecheck.*'
           mongosh --quiet "$MONGO_URI" --eval '
             const a = db.getSiblingDB("workmentor"), b = db.getSiblingDB("restorecheck");
