@@ -23,8 +23,8 @@ jobs:
         shell: bash
     env:
       SOURCE_VERSION: "7.0.42"
-      TARGET_VERSION: "8.3.4"
-      INTERMEDIATE_VERSION: "8.0.34"
+      TARGET_VERSION: "8.3.17"
+      INTERMEDIATE_VERSION: "8.0.38"
       MONGOT_VERSION: "1.78.0"
     steps:
       - uses: actions/checkout@v5
@@ -119,7 +119,7 @@ jobs:
           if grep -q "3. Backup" rerun.log; then echo "::error::re-run took a new backup"; exit 1; fi
 
       - name: Full rollback to the original version
-        # From 8.3.4 / FCV 8.3 with mongot running, back to the source 7.0 server.
+        # From 8.3.17 / FCV 8.3 with mongot running, back to the source 7.0 server.
         run: |
           sudo -E env ASSUME_YES=1 ROLLBACK=1 bash scripts/migrate-mongodb.sh | tee rollback.log
           grep -q "no data will be lost" rollback.log

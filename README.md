@@ -1,6 +1,6 @@
 # db-migration
 
-An in-place upgrade of a single-node MongoDB replica set on Ubuntu 22.04 from **7.0.x → 8.0.34 → 8.3.4**. It then installs **mongot 1.78.0** (MongoDB Search in Community) so that `$vectorSearch` works for the company-documents AI.
+An in-place upgrade of a single-node MongoDB replica set on Ubuntu 22.04 from **7.0.x → 8.0.38 → 8.3.17**. It then installs **mongot 1.78.0** (MongoDB Search in Community) so that `$vectorSearch` works for the company-documents AI.
 
 | File | Purpose |
 |---|---|
@@ -15,7 +15,7 @@ An in-place upgrade of a single-node MongoDB replica set on Ubuntu 22.04 from **
 2. Seed data in the `workmentor` database (organizations, users, attendances, document chunks with embeddings) and a second database.
 3. The migration script runs non-interactively with `STRICT_COUNTS=1`.
 4. After the migration the workflow checks:
-   - version 8.3.4 and FCV 8.3
+   - version 8.3.17 and FCV 8.3
    - the replica set is PRIMARY
    - every count and the unique index are intact
    - authentication is still enforced

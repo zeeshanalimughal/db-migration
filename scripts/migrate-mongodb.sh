@@ -41,7 +41,7 @@
 # (the restore command is printed at the end of the backup step).
 #
 # Optional environment overrides (defaults are what was tested):
-#   TARGET_VERSION=8.3.4       INTERMEDIATE_VERSION=8.0.34
+#   TARGET_VERSION=8.3.17       INTERMEDIATE_VERSION=8.0.38
 #   MONGOT_VERSION=1.78.0      INSTALL_MONGOT=1
 #   BACKUP_ROOT=/var/backups/mongodb-migration
 #   APP_DB=<db from URI, else workmentor>   USERS_COLLECTION=users
@@ -74,8 +74,8 @@ umask 077
 # ----------------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------------
-TARGET_VERSION="${TARGET_VERSION:-8.3.4}"
-INTERMEDIATE_VERSION="${INTERMEDIATE_VERSION:-8.0.34}"
+TARGET_VERSION="${TARGET_VERSION:-8.3.17}"
+INTERMEDIATE_VERSION="${INTERMEDIATE_VERSION:-8.0.38}"
 MONGOT_VERSION="${MONGOT_VERSION:-1.78.0}"
 INSTALL_MONGOT="${INSTALL_MONGOT:-1}"
 BACKUP_ROOT="${BACKUP_ROOT:-/var/backups/mongodb-migration}"
