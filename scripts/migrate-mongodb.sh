@@ -49,7 +49,13 @@
 #   STRICT_COUNTS=0 (1 = fail if any collection count changed)
 #   VERIFY_RESTORE=auto (restore the backup into a temporary mongod and compare
 #                        counts when disk allows; always = required; never = skip)
-#   MONGOT_GRPC_PORT=27028 MONGOT_HEALTH_PORT=8080 MONGOT_METRICS_PORT=9946
+#   MONGOT_GRPC_PORT=27028 MONGOT_HEALTH_PORT=27029 MONGOT_METRICS_PORT=9946
+#   MONGOT_MEMORY_MAX=     (e.g. 2G: memory cap for the mongot service)
+#   CHECK_ONLY=0           (1 = run every pre-flight check and the before
+#                           report, change nothing in MongoDB, exit)
+#
+# Recommended on production: run once with CHECK_ONLY=1, fix anything it
+# reports, take a disk snapshot, stop the app writers, then run for real.
 # =============================================================================
 
 set -Eeuo pipefail
@@ -68,7 +74,10 @@ MONGOD_SERVICE="${MONGOD_SERVICE:-mongod}"
 ASSUME_YES="${ASSUME_YES:-0}"
 STRICT_COUNTS="${STRICT_COUNTS:-0}"
 MONGOT_GRPC_PORT="${MONGOT_GRPC_PORT:-27028}"
-MONGOT_HEALTH_PORT="${MONGOT_HEALTH_PORT:-8080}"
+# Not mongot's documented 8080: on hosts with Varnish, nginx usually listens on 8080.
+MONGOT_HEALTH_PORT="${MONGOT_HEALTH_PORT:-27029}"
+MONGOT_MEMORY_MAX="${MONGOT_MEMORY_MAX:-}"  # e.g. 2G: systemd MemoryMax for mongot (the JVM sizes its heap from it)
+CHECK_ONLY="${CHECK_ONLY:-0}"              # 1 = pre-flight checks + before report only, then exit
 MONGOT_METRICS_PORT="${MONGOT_METRICS_PORT:-9946}"
 START_TIMEOUT="${START_TIMEOUT:-900}"   # seconds to wait for mongod to become PRIMARY
 VERIFY_RESTORE="${VERIFY_RESTORE:-auto}" # auto | always | never  (full restore test of the backup)
@@ -379,6 +388,8 @@ need_cmd mongosh || die "mongosh not found. Install it first: apt-get install mo
 need_cmd curl    || apt_quiet install curl
 need_cmd gpg     || apt_quiet install gnupg
 need_cmd flock   || die "flock missing (util-linux)"
+[[ -z "$MONGOT_MEMORY_MAX" || "$MONGOT_MEMORY_MAX" =~ ^[0-9]+[KMGT]?$ ]] \
+  || die "MONGOT_MEMORY_MAX must look like 2G or 1536M (got '$MONGOT_MEMORY_MAX')"
 need_cmd python3 || die "python3 is required (YAML validation of mongod.conf / mongot config)"
 if ! python3 -c 'import yaml' 2>/dev/null; then
   log "Installing python3-yaml (used to validate config files)"
@@ -500,6 +511,13 @@ ok "All packages are reachable"
 print_report "2. BEFORE migration"
 snapshot_counts "$RUN_DIR/counts-before.tsv"
 log "Collection counts saved to $RUN_DIR/counts-before.tsv ($(wc -l < "$RUN_DIR/counts-before.tsv") collections)"
+
+if [[ "$CHECK_ONLY" == "1" ]]; then
+  step "CHECK ONLY: finished"
+  ok "All pre-flight checks passed. MongoDB was not changed (no backup, no upgrade)."
+  log "Report and counts: $RUN_DIR"
+  exit 0
+fi
 
 ALREADY_DONE=0
 if [[ "$(series_of "$CUR_VER")" == "$TARGET_SERIES" && "$CUR_FCV" == "$TARGET_SERIES" ]]; then
@@ -921,6 +939,7 @@ ExecStart=$MONGOT_HOME/current/mongot --config $MONGOT_ETC/mongot.yml
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=64000
+${MONGOT_MEMORY_MAX:+MemoryMax=$MONGOT_MEMORY_MAX}
 NoNewPrivileges=true
 ProtectSystem=full
 ProtectHome=true

@@ -55,9 +55,22 @@ jobs:
       - name: Query BEFORE migration
         run: mongosh --quiet "$MONGO_URI" ci/query.js
 
+      - name: Check-only run changes nothing
+        run: |
+          sudo -E env CHECK_ONLY=1 bash scripts/migrate-mongodb.sh | tee check.log
+          grep -q "MongoDB was not changed" check.log
+          mongosh --quiet "$MONGO_URI" --eval '
+            const v = db.version(), f = db.adminCommand({getParameter:1, featureCompatibilityVersion:1}).featureCompatibilityVersion.version;
+            print("after CHECK_ONLY: " + v + " FCV " + f);
+            if (!v.startsWith("7.0.") || f !== "7.0") quit(1);'
+          if sudo bash -c 'ls /var/backups/mongodb-migration/*/dump 2>/dev/null' | grep -q .; then
+            echo "::error::CHECK_ONLY created a backup"; exit 1
+          fi
+
       - name: Run the migration script
         # VERIFY_RESTORE=always: the backup must pass a full restore test in CI.
-        run: sudo -E env ASSUME_YES=1 STRICT_COUNTS=1 VERIFY_RESTORE=always bash scripts/migrate-mongodb.sh
+        # MONGOT_MEMORY_MAX: exercise the memory cap recommended for production.
+        run: sudo -E env ASSUME_YES=1 STRICT_COUNTS=1 VERIFY_RESTORE=always MONGOT_MEMORY_MAX=2G bash scripts/migrate-mongodb.sh
 
       - name: Query AFTER migration
         run: mongosh --quiet "$MONGO_URI" ci/query.js
@@ -71,6 +84,9 @@ jobs:
           grep -q 'cursorTimeoutMillis: 600000' /etc/mongod.conf
           python3 -c 'import yaml; c=yaml.safe_load(open("/etc/mongod.conf")); print("mongod.conf setParameter:", c["setParameter"])'
           systemctl is-enabled mongod mongot
+          echo "mongot MemoryMax: $(systemctl show -p MemoryMax --value mongot)"
+          [ "$(systemctl show -p MemoryMax --value mongot)" = "2147483648" ]
+          curl -fsS http://localhost:27029/health
           apt-mark showhold | grep mongodb-org
 
       - name: Restore test (backup archive is usable)
@@ -90,7 +106,7 @@ jobs:
 
       - name: Re-run is safe (idempotent, verify-only)
         run: |
-          sudo -E env ASSUME_YES=1 STRICT_COUNTS=1 bash scripts/migrate-mongodb.sh | tee rerun.log
+          sudo -E env ASSUME_YES=1 STRICT_COUNTS=1 MONGOT_MEMORY_MAX=2G bash scripts/migrate-mongodb.sh | tee rerun.log
           grep -q "mongot already installed" rerun.log
           ! grep -q "3. Backup" rerun.log
 

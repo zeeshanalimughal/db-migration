@@ -31,17 +31,29 @@ Logs are uploaded as the `migration-logs` artifact. The backup archive itself is
 
 The script must be run **on the database host**, as root. The URI must point at the local mongod with a user that has the `root` role.
 
+Recommended order on the production server:
+
 ```bash
-# copy scripts/migrate-mongodb.sh to the server, then:
-sudo bash migrate-mongodb.sh          # prompts for the URI (hidden), then asks you to type MIGRATE
+# 1. Rehearse without changing anything (connection, auth, replica set, keyfile,
+#    disk, ports, package downloads, before report):
+sudo CHECK_ONLY=1 bash migrate-mongodb.sh
+
+# 2. Take an EBS/disk snapshot, then stop the app writers (pm2 stop ...).
+
+# 3. Run the migration (prompts for the URI with hidden input, then asks you to type MIGRATE):
+sudo MONGOT_MEMORY_MAX=2G bash migrate-mongodb.sh
+
+# 4. Start the app again and check it.
 ```
+
+`CHECK_ONLY=1` does not touch MongoDB. The only thing it may install is `python3-yaml`, if it is missing.
 
 Before you run it:
 
 - **Disk:** the root disk is at 89% (8.8 GB free). The script refuses to start unless free space is larger than the uncompressed data size plus 1 GiB. If the backup should go to another disk, use `BACKUP_ROOT=/mnt/other sudo -E bash migrate-mongodb.sh`.
 - **Downtime:** mongod restarts 3 times (8.0, 8.3, then search parameters). Stop the app writers first (`pm2 stop ...`) so the backup is consistent and the count comparison is exact.
-- **Memory:** mongot is a JVM process and keeps the vector index in memory. The server already uses 1.4 GB of swap, so watch memory after enabling it.
-- **Ports:** mongot uses 27028 (gRPC), 8080 (health) and 9946 (metrics), all on localhost. The script stops if any of them is already taken. Override them with `MONGOT_*_PORT`.
+- **Memory:** mongot is a JVM process and keeps the vector index in memory. The server already uses 1.4 GB of swap. `MONGOT_MEMORY_MAX=2G` caps the service through systemd, and the JVM sizes its heap from that cap. Raise the cap if the index grows.
+- **Ports:** mongot uses 27028 (gRPC), 27029 (health) and 9946 (metrics), all on localhost. The health port is not the documented 8080 because nginx often listens there behind Varnish. The script stops if any of these ports is already taken. Override them with `MONGOT_*_PORT`.
 - **Backup verification:** the script checks the dump log against the live collections. It also restores the whole archive into a temporary mongod on a local port and compares every collection's document and index counts. That restore test needs about (data + indexes + 1 GiB) of free disk. With the default `VERIFY_RESTORE=auto` it is skipped with a warning when space is short; `always` makes it mandatory and `never` turns it off.
 - Take an EBS/disk snapshot as well. The script's `mongodump` is a logical backup; a snapshot is the fastest way back.
 
