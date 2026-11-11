@@ -238,10 +238,11 @@ print_report() {
 COUNTS_JS='
 const res = {};
 db.adminCommand({listDatabases:1, nameOnly:true}).databases.forEach(d => {
-  if (["local","config"].includes(d.name)) return;
+  // local/config are internal; __mdb_internal_* holds mongot metadata created by the migration itself.
+  if (["local","config"].includes(d.name) || d.name.startsWith("__mdb")) return;
   const sdb = db.getSiblingDB(d.name);
   sdb.getCollectionInfos({type:"collection"}).forEach(ci => {
-    if (ci.name.startsWith("system.")) return;
+    if (ci.name.startsWith("system.") || ci.name.startsWith("__mdb")) return;
     res[d.name + "." + ci.name] = sdb.getCollection(ci.name).countDocuments({});
   });
 });
@@ -284,7 +285,9 @@ unit_pid="$(systemctl show -p MainPID --value "$MONGOD_SERVICE")"
   || die "The URI connects to mongod pid $srv_pid but ${MONGOD_SERVICE}.service runs pid $unit_pid. Run the script on the DB host with a URI to the local mongod."
 ok "URI points at the local ${MONGOD_SERVICE} (pid $unit_pid)"
 
-dpkg-query -W -f='${Status}' mongodb-org-server 2>/dev/null | grep -q "install ok installed" \
+# Status is "<want> <flag> <state>": "install ok installed" or, for packages
+# pinned with apt-mark hold (common on production), "hold ok installed".
+[[ "$(dpkg-query -W -f='${Status}' mongodb-org-server 2>/dev/null | awk '{print $3}')" == "installed" ]] \
   || die "mongodb-org-server is not installed via apt. Only apt installs are supported."
 PKG_VER="$(dpkg-query -W -f='${Version}' mongodb-org-server)"
 mapfile -t ORG_PKGS < <(dpkg-query -W -f='${Package} ${Status}\n' 'mongodb-org*' 2>/dev/null \
@@ -558,7 +561,7 @@ set_fcv() {
 health_check() {
   local v f st
   v="$(server_version)"; f="$(fcv)"
-  st="$(js 'const s=db.adminCommand({replSetGetStatus:1}); print(s.myState===1 && s.members.every(m=>m.health===1) ? "HEALTHY" : "UNHEALTHY")')"
+  st="$(js 'const s=db.adminCommand({replSetGetStatus:1}); print(Number(s.myState)===1 && s.members.every(m=>Number(m.health)===1) ? "HEALTHY" : "UNHEALTHY")')"
   [[ "$st" == "HEALTHY" ]] || die "Replica set unhealthy after upgrade"
   js "const r=db.getSiblingDB('$APP_DB').runCommand({ping:1}); if(r.ok!==1) quit(2);" \
     || die "Database $APP_DB not reachable"
@@ -656,7 +659,8 @@ install_mongot() {
     curl -fsSL --retry 5 --retry-delay 5 -o "$tgz" "$base"
     mkdir -p "$TMP_DIR/mongot-x"
     tar -xzf "$tgz" -C "$TMP_DIR/mongot-x"
-    local launcher; launcher="$(find "$TMP_DIR/mongot-x" -maxdepth 3 -type f -name mongot | head -1)"
+    # The shallowest file named "mongot" is the launcher script.
+    local launcher; launcher="$(find "$TMP_DIR/mongot-x" -maxdepth 3 -type f -name mongot -printf '%d %p\n' | sort -n | head -1 | cut -d' ' -f2-)"
     [[ -n "$launcher" ]] || die "mongot launcher not found in tarball"
     mkdir -p "$MONGOT_HOME"
     rm -rf "$dest"; cp -a "$(dirname "$launcher")" "$dest"
