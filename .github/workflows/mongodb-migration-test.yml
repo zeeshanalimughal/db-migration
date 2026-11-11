@@ -23,7 +23,7 @@ jobs:
       INTERMEDIATE_VERSION: "8.0.34"
       MONGOT_VERSION: "1.78.0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Generate credentials (masked)
         run: |
@@ -125,7 +125,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: migration-logs
           path: ci-logs

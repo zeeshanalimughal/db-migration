@@ -1009,7 +1009,7 @@ snapshot_counts "$RUN_DIR/counts-after.tsv"
 
 step "8. Data comparison (document counts per collection)"
 if diff -u "$RUN_DIR/counts-before.tsv" "$RUN_DIR/counts-after.tsv" > "$RUN_DIR/counts.diff"; then
-  ok "All $(wc -l < "$RUN_DIR/counts-after.tsv") collections have identical document counts"
+  ok "All $(wc -l < "$RUN_DIR/counts-after.tsv") collections have identical document and index counts"
 else
   cat "$RUN_DIR/counts.diff"
   if [[ "$STRICT_COUNTS" == "1" ]]; then

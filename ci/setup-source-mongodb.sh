@@ -8,6 +8,9 @@ set -Eeuo pipefail
 SOURCE_VERSION="${SOURCE_VERSION:-7.0.42}"
 FALLBACK_VERSION="${FALLBACK_VERSION:-7.0.41}"
 : "${ADMIN_PW:?ADMIN_PW must be set}"
+# Under `sudo -E`, HOME is the runner's home; mongosh run as root would create a
+# root-owned ~/.mongodb there and later non-root mongosh calls print EACCES warnings.
+export HOME=/root
 
 echo "::group::Remove any preinstalled MongoDB"
 systemctl stop mongod 2>/dev/null || true
