@@ -278,7 +278,7 @@ systemctl is-active --quiet "$MONGOD_SERVICE" || die "${MONGOD_SERVICE} is not r
 
 # The URI must reach the mongod managed by this host's systemd unit, otherwise
 # we would upgrade local packages while talking to a different server.
-srv_pid="$(js 'print(db.serverStatus().pid)')"
+srv_pid="$(js 'print(Number(db.serverStatus().pid))')"
 unit_pid="$(systemctl show -p MainPID --value "$MONGOD_SERVICE")"
 [[ "$srv_pid" == "$unit_pid" ]] \
   || die "The URI connects to mongod pid $srv_pid but ${MONGOD_SERVICE}.service runs pid $unit_pid. Run the script on the DB host with a URI to the local mongod."
@@ -307,7 +307,7 @@ case "$(series_of "$CUR_VER")" in
   *) die "Unsupported starting version $CUR_VER (expected 7.0.x, 8.0.x or ${TARGET_SERIES}.x)." ;;
 esac
 
-rs_info="$(js 'const s=db.adminCommand({replSetGetStatus:1}); print(s.members.length + " " + s.myState + " " + s.set)' 2>&1)" \
+rs_info="$(js 'const s=db.adminCommand({replSetGetStatus:1}); print(s.members.length + " " + Number(s.myState) + " " + s.set)' 2>&1)" \
   || die "Replica set status unavailable. This script expects a replica set (got: $rs_info)."
 read -r RS_MEMBERS RS_STATE RS_NAME <<<"$rs_info"
 [[ "$RS_STATE" == "1" ]] || die "This node is not PRIMARY (state $RS_STATE)."
@@ -335,7 +335,7 @@ esac
 
 # Disk space for the backup: uncompressed data size + 1 GiB margin (gzip usually
 # shrinks it a lot, so this is conservative).
-DATA_BYTES="$(js 'let t=0; db.adminCommand({listDatabases:1}).databases.forEach(d=>{ if(d.name!=="local") t+=db.getSiblingDB(d.name).stats().dataSize; }); print(Math.ceil(t))')"
+DATA_BYTES="$(js 'let t=0; db.adminCommand({listDatabases:1}).databases.forEach(d=>{ if(d.name!=="local") t+=Number(db.getSiblingDB(d.name).stats().dataSize); }); print(Math.ceil(t))')"
 FREE_BYTES="$(df -B1 --output=avail "$BACKUP_ROOT" | tail -1 | tr -d ' ')"
 NEED_BYTES=$(( DATA_BYTES + 1073741824 ))
 log "Data size: $((DATA_BYTES/1048576)) MiB; free on $(df --output=target "$BACKUP_ROOT" | tail -1): $((FREE_BYTES/1048576)) MiB"
