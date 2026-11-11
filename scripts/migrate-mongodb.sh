@@ -342,7 +342,10 @@ restore_test() {
     || { tail -20 "$tdir/mongod.log"; return 1; }
   local turi="mongodb://127.0.0.1:$port/?directConnection=true"
   log "Restore test: mongorestore --oplogReplay of the full archive ..."
-  if ! mongorestore --uri "$turi" --gzip --archive="$archive" --oplogReplay --nsExclude 'config.*' \
+  # Same command as a real recovery (see RESTORE.txt). --oplogReplay cannot be
+  # combined with --nsInclude/--nsExclude; mongorestore skips the internal
+  # config.* session/transaction collections on its own.
+  if ! mongorestore --uri "$turi" --gzip --archive="$archive" --oplogReplay \
         2>"$tdir/restore.log" 9>&-; then
     tail -20 "$tdir/restore.log"; stop_restore_mongod; return 1
   fi
@@ -555,7 +558,7 @@ if [[ "$ALREADY_DONE" == "0" ]]; then
       RESTORE_FREE="$(df -B1 --output=avail "$RUN_DIR" | tail -1 | tr -d ' ')"
       RESTORE_NEED=$(( DATA_BYTES + INDEX_BYTES + 1073741824 ))
       if (( RESTORE_FREE > RESTORE_NEED )); then
-        restore_test "$ARCHIVE" || die "Restore test failed: the backup is not trustworthy. Nothing was changed."
+        restore_test "$ARCHIVE" || die "Restore test failed (see the output above; logs in $RUN_DIR/restore-test). The live server was not changed."
       elif [[ "$VERIFY_RESTORE" == "always" ]]; then
         die "Not enough disk for the restore test (need ~$((RESTORE_NEED/1048576)) MiB free)."
       else
