@@ -27,7 +27,7 @@ echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-7.0.gp
 apt-get update -q
 
 VER="$SOURCE_VERSION"
-if ! apt-cache madison mongodb-org-server | awk '{print $3}' | grep -qx "$VER"; then
+if ! grep -qx "$VER" <<<"$(apt-cache madison mongodb-org-server | awk '{print $3}')"; then
   echo "::warning::mongodb-org $VER is not published in the MongoDB apt repo (it was never released as a GA package / was withdrawn). Using $FALLBACK_VERSION, the closest published 7.0 release, as the source version."
   VER="$FALLBACK_VERSION"
 fi
@@ -88,7 +88,7 @@ mongosh --quiet --eval '
 echo "::endgroup::"
 
 # Authorization really is enforced:
-if mongosh --quiet --eval 'db.adminCommand({listDatabases: 1}).ok' 2>/dev/null | grep -qx 1; then
+if [ "$(mongosh --quiet --eval 'db.adminCommand({listDatabases: 1}).ok' 2>/dev/null || true)" = "1" ]; then
   echo "::error::Unauthenticated listDatabases succeeded - auth is not enforced"; exit 1
 fi
 echo "Source server ready: $(mongod --version | head -1)"

@@ -17,6 +17,10 @@ jobs:
     # Same OS as production (Ubuntu 22.04 jammy, x86_64, systemd).
     runs-on: ubuntu-22.04
     timeout-minutes: 60
+    defaults:
+      run:
+        # bash -eo pipefail: a failing script is not masked by `| tee`.
+        shell: bash
     env:
       SOURCE_VERSION: "7.0.42"
       TARGET_VERSION: "8.3.4"
@@ -63,14 +67,18 @@ jobs:
             const v = db.version(), f = db.adminCommand({getParameter:1, featureCompatibilityVersion:1}).featureCompatibilityVersion.version;
             print("after CHECK_ONLY: " + v + " FCV " + f);
             if (!v.startsWith("7.0.") || f !== "7.0") quit(1);'
-          if sudo bash -c 'ls /var/backups/mongodb-migration/*/dump 2>/dev/null' | grep -q .; then
+          if [ -n "$(sudo bash -c 'ls -d /var/backups/mongodb-migration/*/dump 2>/dev/null' || true)" ]; then
             echo "::error::CHECK_ONLY created a backup"; exit 1
           fi
 
       - name: Run the migration script
         # VERIFY_RESTORE=always: the backup must pass a full restore test in CI.
         # MONGOT_MEMORY_MAX: exercise the memory cap recommended for production.
-        run: sudo -E env ASSUME_YES=1 STRICT_COUNTS=1 VERIFY_RESTORE=always MONGOT_MEMORY_MAX=2G bash scripts/migrate-mongodb.sh
+        # COLD_BACKUP=always: the rollback snapshot must be taken (rollback is tested below).
+        run: |
+          sudo -E env ASSUME_YES=1 STRICT_COUNTS=1 VERIFY_RESTORE=always COLD_BACKUP=always MONGOT_MEMORY_MAX=2G \
+            bash scripts/migrate-mongodb.sh | tee migrate.log
+          grep -q "Rollback snapshot complete" migrate.log
 
       - name: Query AFTER migration
         run: mongosh --quiet "$MONGO_URI" ci/query.js
@@ -78,7 +86,7 @@ jobs:
       - name: Verify version, data, auth and $vectorSearch
         run: |
           EXPECT_VERSION="$TARGET_VERSION" mongosh --quiet "$MONGO_URI" ci/verify-after.js
-          if mongosh --quiet "mongodb://127.0.0.1:27017/?directConnection=true" --eval 'db.adminCommand({listDatabases:1}).ok' 2>/dev/null | grep -qx 1; then
+          if [ "$(mongosh --quiet "mongodb://127.0.0.1:27017/?directConnection=true" --eval 'db.adminCommand({listDatabases:1}).ok' 2>/dev/null || true)" = "1" ]; then
             echo "::error::auth no longer enforced after migration"; exit 1
           fi
           grep -q 'cursorTimeoutMillis: 600000' /etc/mongod.conf
@@ -108,7 +116,34 @@ jobs:
         run: |
           sudo -E env ASSUME_YES=1 STRICT_COUNTS=1 MONGOT_MEMORY_MAX=2G bash scripts/migrate-mongodb.sh | tee rerun.log
           grep -q "mongot already installed" rerun.log
-          ! grep -q "3. Backup" rerun.log
+          if grep -q "3. Backup" rerun.log; then echo "::error::re-run took a new backup"; exit 1; fi
+
+      - name: Full rollback to the original version
+        # From 8.3.4 / FCV 8.3 with mongot running, back to the source 7.0 server.
+        run: |
+          sudo -E env ASSUME_YES=1 ROLLBACK=1 bash scripts/migrate-mongodb.sh | tee rollback.log
+          grep -q "no data will be lost" rollback.log
+          grep -q "Rollback finished successfully" rollback.log
+
+      - name: Verify the rollback (same URI, original version and data)
+        run: |
+          mongosh --quiet "$MONGO_URI" ci/query.js
+          EXPECT_VERSION="$SOURCE_VERSION_USED" mongosh --quiet "$MONGO_URI" ci/verify-rollback.js
+          grep -xF "db version v$SOURCE_VERSION_USED" <<<"$(mongod --version)"
+          RUN="$(sudo bash -c 'ls -1dt /var/backups/mongodb-migration/*/ | while read d; do [ -f "$d/ROLLBACK.env" ] && { echo "$d"; break; }; done')"
+          echo "snapshot run: $RUN"
+          sudo cmp /etc/mongod.conf "${RUN}files/mongod.conf"
+          echo "OK mongod.conf is byte-identical to the original"
+          if grep -q mongotHost /etc/mongod.conf; then echo "::error::search parameters still in mongod.conf"; exit 1; fi
+          if systemctl is-active --quiet mongot; then echo "::error::mongot still running"; exit 1; fi
+          if [ "$(systemctl is-enabled mongot 2>/dev/null || true)" = "enabled" ]; then echo "::error::mongot still enabled"; exit 1; fi
+          echo "OK mongot stopped and disabled"
+          sudo bash -c 'ls -d /var/lib/mongodb.before-rollback-*'
+          echo "OK replaced dbPath kept aside"
+          if [ "$(mongosh --quiet "mongodb://127.0.0.1:27017/?directConnection=true" --eval 'db.adminCommand({listDatabases:1}).ok' 2>/dev/null || true)" = "1" ]; then
+            echo "::error::auth not enforced after rollback"; exit 1
+          fi
+          echo "OK authentication enforced"
 
       - name: Collect logs
         if: always()

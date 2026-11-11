@@ -53,6 +53,16 @@
 #   MONGOT_MEMORY_MAX=     (e.g. 2G: memory cap for the mongot service)
 #   CHECK_ONLY=0           (1 = run every pre-flight check and the before
 #                           report, change nothing in MongoDB, exit)
+#   COLD_BACKUP=auto       (copy the whole dbPath while mongod is stopped before
+#                           the first binary upgrade, so ROLLBACK=1 can restore
+#                           the exact previous state; always = required; never = off)
+#
+# ROLLBACK (back to the version that was running before the migration, e.g. 7.0.42):
+#   sudo ROLLBACK=1 bash migrate-mongodb.sh
+# Restores the rollback snapshot of the dbPath, the saved mongod/mongos binaries
+# and the original mongod.conf, stops mongot, then verifies version, FCV, replica
+# set, login and collection counts. The dbPath being replaced is moved aside,
+# never deleted. Data written after the snapshot is NOT in the rolled-back DB.
 #
 # Recommended on production: run once with CHECK_ONLY=1, fix anything it
 # reports, take a disk snapshot, stop the app writers, then run for real.
@@ -78,6 +88,9 @@ MONGOT_GRPC_PORT="${MONGOT_GRPC_PORT:-27028}"
 MONGOT_HEALTH_PORT="${MONGOT_HEALTH_PORT:-27029}"
 MONGOT_MEMORY_MAX="${MONGOT_MEMORY_MAX:-}"  # e.g. 2G: systemd MemoryMax for mongot (the JVM sizes its heap from it)
 CHECK_ONLY="${CHECK_ONLY:-0}"              # 1 = pre-flight checks + before report only, then exit
+COLD_BACKUP="${COLD_BACKUP:-auto}"         # auto | always | never: offline copy of dbPath for a full rollback
+ROLLBACK="${ROLLBACK:-0}"                  # 1 = roll back to the snapshot taken by a previous run
+ROLLBACK_FROM="${ROLLBACK_FROM:-}"         # run directory to roll back from (default: newest with a snapshot)
 MONGOT_METRICS_PORT="${MONGOT_METRICS_PORT:-9946}"
 START_TIMEOUT="${START_TIMEOUT:-900}"   # seconds to wait for mongod to become PRIMARY
 VERIFY_RESTORE="${VERIFY_RESTORE:-auto}" # auto | always | never  (full restore test of the backup)
@@ -118,7 +131,13 @@ on_error() {
 }
 trap 'on_error $LINENO' ERR
 cleanup() {
+  local rc=$?
   stop_restore_mongod 2>/dev/null || true
+  if (( rc != 0 )) && [[ "$ROLLBACK" != "1" && -n "${RUN_DIR:-}" && -f "$RUN_DIR/cold/.complete" ]]; then
+    printf '\n%sA rollback snapshot of the previous state exists (%s).%s\n' "$C_Y" "$RUN_DIR/cold" "$C_0" >&2
+    printf 'Either fix the cause and re-run the script (it resumes), or go back to the\n' >&2
+    printf 'previous version exactly as it was:  sudo ROLLBACK=1 bash %s\n' "$0" >&2
+  fi
   [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
   return 0
 }
@@ -339,7 +358,7 @@ stop_restore_mongod() {
 restore_test() {
   local archive="$1" tdir="$RUN_DIR/restore-test" port="" p
   for p in $(seq 27090 27099); do
-    ss -Hltn "sport = :$p" | grep -q . || { port="$p"; break; }
+    [[ -n "$(ss -Hltn "sport = :$p")" ]] || { port="$p"; break; }
   done
   [[ -n "$port" ]] || { warn "No free port in 27090-27099 for the restore test"; return 1; }
   rm -rf "$tdir"; mkdir -p "$tdir/db"
@@ -378,6 +397,315 @@ restore_test() {
     ok "Restore test passed: all collections and indexes restored (document counts moved because of live writes)"
   fi
 }
+
+# ----------------------------------------------------------------------------
+# Confirmation, rollback snapshot and full rollback
+# ----------------------------------------------------------------------------
+confirm_word() {
+  local word="$1" answer
+  [[ "$ASSUME_YES" == "1" ]] && return 0
+  [[ -t 0 ]] || die "No terminal for confirmation. Re-run interactively or set ASSUME_YES=1."
+  read -r -p "Type $word to continue: " answer
+  [[ "$answer" == "$word" ]] || die "Aborted by user."
+}
+
+# Database name from the URI path (empty if none).
+uri_db() {
+  local rest="${1#*://}" hosts tail db=""
+  hosts="${rest%%[/?]*}"; tail="${rest:${#hosts}}"
+  if [[ "$tail" == /* ]]; then tail="${tail#/}"; db="${tail%%\?*}"; fi
+  echo "$db"
+}
+
+# Signature of a directory tree: relative path + size of every file.
+tree_sig() { find "$1" -type f -printf '%P %s\n' | LC_ALL=C sort | sha256sum | cut -d' ' -f1; }
+
+COLD_PLANNED=0
+cold_space_ok() {
+  local need free
+  need=$(( $(du -sb "$DBPATH" | cut -f1) + 1073741824 ))
+  free="$(df -B1 --output=avail "$RUN_DIR" | tail -1 | tr -d ' ')"
+  (( free > need ))
+}
+
+# Copies the whole dbPath while mongod is stopped (files are consistent), and
+# records what is needed to return to exactly this state.
+take_cold_copy() {
+  local prev_ver="$1" prev_fcv="$2" dst="$RUN_DIR/cold/db" t0=$SECONDS a b
+  log "Rollback snapshot: copying $DBPATH ($(du -sh "$DBPATH" | cut -f1)) while mongod is stopped ..."
+  mkdir -p "$RUN_DIR/cold"; rm -rf "$dst"
+  cp -a "$DBPATH" "$dst" || return 1
+  a="$(tree_sig "$DBPATH")"; b="$(tree_sig "$dst")"
+  [[ -n "$a" && "$a" == "$b" ]] || { warn "Snapshot does not match the source ($a / $b)"; return 1; }
+  {
+    printf 'PREV_VERSION=%q\n' "$prev_ver"
+    printf 'PREV_FCV=%q\n' "$prev_fcv"
+    printf 'SNAP_DBPATH=%q\n' "$DBPATH"
+    printf 'SNAP_CONF=%q\n' "$CONF"
+    printf 'SNAP_MONGOD_BIN=%q\n' "$(command -v mongod)"
+    printf 'SNAP_MONGOS_BIN=%q\n' "$(command -v mongos || true)"
+    printf 'SNAP_TS=%q\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } > "$RUN_DIR/ROLLBACK.env"
+  echo "$a" > "$RUN_DIR/cold/.complete"
+  ok "Rollback snapshot complete in $((SECONDS - t0))s: $dst"
+}
+
+do_rollback() {
+  step "ROLLBACK 1/4: find the snapshot"
+  local src="$ROLLBACK_FROM" d
+  if [[ -z "$src" ]]; then
+    while IFS= read -r d; do
+      d="${d%/}"
+      if [[ -f "$d/ROLLBACK.env" && -f "$d/cold/.complete" ]]; then src="$d"; break; fi
+    done < <(ls -1dt "$BACKUP_ROOT"/*/ 2>/dev/null)
+  fi
+  src="${src%/}"
+  [[ -n "$src" && -f "$src/ROLLBACK.env" && -f "$src/cold/.complete" && -d "$src/cold/db" ]] \
+    || die "No complete rollback snapshot found under $BACKUP_ROOT${ROLLBACK_FROM:+ (ROLLBACK_FROM=$ROLLBACK_FROM)}."
+  local PREV_VERSION="" PREV_FCV="" SNAP_DBPATH="" SNAP_CONF="" SNAP_MONGOD_BIN="" SNAP_MONGOS_BIN="" SNAP_TS=""
+  # shellcheck disable=SC1090,SC1091
+  . "$src/ROLLBACK.env"   # written by take_cold_copy, root-only directory
+  [[ -n "$PREV_VERSION" && -n "$PREV_FCV" && -n "$SNAP_DBPATH" && -n "$SNAP_CONF" && -n "$SNAP_MONGOD_BIN" ]] \
+    || die "Incomplete $src/ROLLBACK.env"
+  local bin_dir="$src/files/bin-$PREV_VERSION" conf_saved
+  conf_saved="$src/files/$(basename "$SNAP_CONF")"
+  [[ -x "$bin_dir/mongod" ]] || die "Saved mongod $PREV_VERSION binary missing in $bin_dir"
+  grep -qxF "db version v$PREV_VERSION" <<<"$("$bin_dir/mongod" --version 2>/dev/null || true)" \
+    || die "$bin_dir/mongod is not version $PREV_VERSION"
+  [[ -f "$conf_saved" ]] || die "Saved $(basename "$SNAP_CONF") missing in $src/files"
+  log "Checking the snapshot files ..."
+  [[ "$(tree_sig "$src/cold/db")" == "$(cat "$src/cold/.complete")" ]] || die "Snapshot $src/cold/db does not match its recorded signature"
+  mountpoint -q "$SNAP_DBPATH" && die "dbPath $SNAP_DBPATH is a mount point; this script cannot swap it. Restore $src/cold/db into it manually."
+  ok "Snapshot $src: MongoDB $PREV_VERSION (FCV $PREV_FCV), taken $SNAP_TS"
+
+  DBPATH="$SNAP_DBPATH"; CONF="$SNAP_CONF"
+  [[ -n "${APP_DB:-}" ]] || APP_DB="$(uri_db "$MIG_URI")"
+  [[ -n "$APP_DB" && "$APP_DB" != "admin" && "$APP_DB" != "test" ]] || APP_DB="workmentor"
+  local ref="$src/counts-post-dump.tsv"; [[ -f "$ref" ]] || ref="$src/counts-before.tsv"
+
+  if [[ "$(js_try 'print("UP")')" == "UP" ]]; then
+    log "Currently running: MongoDB $(server_version) (FCV $(fcv))"
+    js "$COUNTS_JS" > "$RUN_DIR/counts-before-rollback.tsv" 2>/dev/null || true
+    if diff -u "$ref" "$RUN_DIR/counts-before-rollback.tsv" > "$RUN_DIR/rollback-data-diff.txt"; then
+      ok "Current collections and counts match the snapshot: no data will be lost."
+    else
+      warn "Current data differs from the snapshot (namespace, documents, indexes). These changes will NOT be"
+      warn "in the rolled-back database; they stay in the moved-aside dbPath:"
+      cat "$RUN_DIR/rollback-data-diff.txt"
+    fi
+  else
+    warn "mongod is not reachable right now (expected if the upgrade failed); continuing."
+  fi
+
+  cat <<EOF
+
+${C_B}About to roll back MongoDB on $(hostname) to $PREV_VERSION (FCV $PREV_FCV)${C_0}
+  data:    $src/cold/db  ->  $DBPATH   (current dbPath is moved aside, not deleted)
+  binary:  $bin_dir/mongod  ->  $SNAP_MONGOD_BIN
+  config:  $conf_saved  ->  $CONF
+  mongot:  stopped and disabled
+
+EOF
+  confirm_word ROLLBACK
+
+  step "ROLLBACK 2/4: stop services"
+  if systemctl cat mongot >/dev/null 2>&1; then
+    systemctl disable --now mongot >/dev/null 2>&1 || true
+    ok "mongot stopped and disabled"
+  fi
+  stop_mongod
+
+  step "ROLLBACK 3/4: restore data, binaries and config"
+  local aside="${DBPATH%/}.before-rollback-$TS" need free
+  mv "$DBPATH" "$aside"
+  ok "Current dbPath moved aside to $aside (kept, not deleted)"
+  need=$(( $(du -sb "$src/cold/db" | cut -f1) + 536870912 ))
+  free="$(df -B1 --output=avail "$(dirname "$DBPATH")" | tail -1 | tr -d ' ')"
+  if (( free > need )); then
+    cp -a "$src/cold/db" "$DBPATH"
+    ok "Snapshot copied to $DBPATH (the snapshot itself is kept)"
+  else
+    warn "Not enough free space to copy; moving the snapshot into place instead."
+    mv "$src/cold/db" "$DBPATH"; rm -f "$src/cold/.complete"
+  fi
+  install -m 755 -o root -g root "$bin_dir/mongod" "$SNAP_MONGOD_BIN"
+  if [[ -n "$SNAP_MONGOS_BIN" && -x "$bin_dir/mongos" ]]; then
+    install -m 755 -o root -g root "$bin_dir/mongos" "$SNAP_MONGOS_BIN"
+  fi
+  cat "$conf_saved" > "$CONF"
+  ok "Restored mongod $PREV_VERSION and the original $CONF"
+
+  step "ROLLBACK 4/4: start and verify"
+  systemctl daemon-reload
+  start_mongod || die "mongod $PREV_VERSION did not start. dbPath: $DBPATH; moved-aside dbPath: $aside. See journalctl -u $MONGOD_SERVICE"
+  local v f
+  v="$(server_version)"; f="$(fcv)"
+  [[ "$v" == "$PREV_VERSION" ]] || die "Expected version $PREV_VERSION after rollback, got $v"
+  [[ "$f" == "$PREV_FCV" ]] || die "Expected FCV $PREV_FCV after rollback, got $f"
+  health_check
+  snapshot_counts "$RUN_DIR/counts-after-rollback.tsv"
+  diff -u "$ref" "$RUN_DIR/counts-after-rollback.tsv" \
+    || die "Collections after the rollback differ from the snapshot (see diff above)"
+  ok "All $(wc -l < "$RUN_DIR/counts-after-rollback.tsv") collections match the snapshot (documents and indexes)"
+  print_report "ROLLBACK result"
+
+  step "ROLLBACK DONE"
+  printf '%-28s %s\n' "MongoDB version:" "$v"
+  printf '%-28s %s\n' "featureCompatibilityVersion:" "$f"
+  printf '%-28s %s\n' "Replica set:" "$(js 'const s=db.adminCommand({replSetGetStatus:1}); print(s.set + " (" + s.members[0].stateStr + ")")')"
+  printf '%-28s %s\n' "Moved-aside dbPath:" "$aside"
+  printf '%-28s %s\n' "Logs:" "$RUN_DIR"
+  warn "apt still lists the newer mongodb-org packages (held); the binaries are the saved $PREV_VERSION copies."
+  warn "Keep the packages held, and do not run apt upgrades of mongodb-org until you migrate again."
+  ok "Rollback finished successfully."
+  exit 0
+}
+
+# ----------------------------------------------------------------------------
+# Binary upgrade with automatic rollback (only valid while FCV is unchanged)
+# ----------------------------------------------------------------------------
+add_apt_repo() {
+  local series="$1"
+  if [[ ! -s "$APT_KEYRING" ]]; then
+    log "Importing MongoDB ${APT_KEY_SERIES} signing key"
+    export GNUPGHOME="$TMP_DIR/gnupg"; mkdir -p -m 700 "$GNUPGHOME"
+    curl -fsSL "https://pgp.mongodb.com/server-${APT_KEY_SERIES}.asc" | gpg --batch --yes --dearmor -o "$APT_KEYRING.tmp"
+    grep -qF "$APT_KEY_FINGERPRINT" <<<"$(gpg --batch --show-keys --with-colons "$APT_KEYRING.tmp" 2>/dev/null || true)" \
+      || { rm -f "$APT_KEYRING.tmp"; die "Signing key fingerprint mismatch"; }
+    mv "$APT_KEYRING.tmp" "$APT_KEYRING"; chmod 644 "$APT_KEYRING"
+  fi
+  echo "deb [ arch=amd64,arm64 signed-by=$APT_KEYRING ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/${series} multiverse" \
+    > "/etc/apt/sources.list.d/mongodb-org-${series}.list"
+  chmod 644 "/etc/apt/sources.list.d/mongodb-org-${series}.list"
+  apt_quiet update -o Dir::Etc::sourcelist="sources.list.d/mongodb-org-${series}.list" \
+    -o Dir::Etc::sourceparts="-" -o APT::Get::List-Cleanup="0" >/dev/null
+}
+
+install_mongodb_pkgs() {
+  local ver="$1" args=() p
+  for p in "${ORG_PKGS[@]}"; do
+    [[ "$p" == "mongodb-org-shell" ]] && continue   # legacy shell does not exist in 8.x
+    args+=("$p=$ver")
+  done
+  apt-mark unhold "${ORG_PKGS[@]}" >/dev/null 2>&1 || true
+  apt_quiet install --allow-downgrades --allow-change-held-packages "${args[@]}" || return 1
+  apt-mark hold "${args[@]%%=*}" >/dev/null || return 1
+}
+
+stop_mongod() {
+  log "Stopping ${MONGOD_SERVICE} cleanly ..."
+  # Clean shutdown through the server first (flushes, steps down), then systemd.
+  js_try 'db.adminCommand({shutdown: 1, timeoutSecs: 60})' >/dev/null
+  systemctl stop "$MONGOD_SERVICE" || true
+  local i
+  for i in $(seq 1 120); do systemctl is-active --quiet "$MONGOD_SERVICE" || break; sleep 1; done
+  systemctl is-active --quiet "$MONGOD_SERVICE" && die "mongod did not stop"
+  pgrep -x mongod >/dev/null && die "A mongod process is still running"
+  ok "mongod stopped"
+}
+
+start_mongod() {
+  systemctl reset-failed "$MONGOD_SERVICE" 2>/dev/null || true
+  systemctl start "$MONGOD_SERVICE"
+  wait_primary
+}
+
+rollback_binaries() {
+  local prev_ver="$1" saved_dir="$2"
+  warn "Rolling back mongod binaries to $prev_ver (FCV was not changed) ..."
+  systemctl stop "$MONGOD_SERVICE" || true
+  if grep -qx "$prev_ver" <<<"$(apt-cache madison mongodb-org-server | awk '{print $3}')" \
+     && install_mongodb_pkgs "$prev_ver"; then
+    ok "Reinstalled packages $prev_ver"
+  elif [[ -x "$saved_dir/mongod" ]]; then
+    warn "Package $prev_ver not available in apt; restoring the saved mongod binary."
+    install -m 755 "$saved_dir/mongod" "$(command -v mongod || echo /usr/bin/mongod)"
+    [[ -x "$saved_dir/mongos" ]] && install -m 755 "$saved_dir/mongos" /usr/bin/mongos
+  else
+    die "Rollback impossible: no saved binary. Restore from $RUN_DIR."
+  fi
+  start_mongod || die "mongod did not start after rollback. See journalctl -u $MONGOD_SERVICE"
+  ok "Rolled back to $(server_version)"
+}
+
+upgrade_binaries() {
+  local to_ver="$1" to_series; to_series="$(series_of "$1")"
+  local prev_ver; prev_ver="$(dpkg-query -W -f='${Version}' mongodb-org-server)"
+  local saved="$RUN_DIR/files/bin-$prev_ver"
+  if [[ ! -x "$saved/mongod" ]]; then mkdir -p "$saved"; cp -a "$(command -v mongod)" "$saved/"; fi
+
+  log "Adding apt repository mongodb-org/$to_series"
+  add_apt_repo "$to_series"
+
+  # Pre-download everything while mongod is still running, to keep downtime short.
+  log "Downloading packages $to_ver ..."
+  local args=() p
+  for p in "${ORG_PKGS[@]}"; do [[ "$p" == "mongodb-org-shell" ]] || args+=("$p=$to_ver"); done
+  apt_quiet install --download-only --allow-change-held-packages "${args[@]}" >/dev/null
+
+  # Rollback snapshot: only once per run, before the first binary change.
+  local want_cold=0 fcv_before
+  fcv_before="$(fcv)"
+  if [[ "$COLD_PLANNED" == "1" && ! -f "$RUN_DIR/cold/.complete" ]]; then
+    cold_space_ok || {
+      [[ "$COLD_BACKUP" == "always" ]] && die "Not enough disk left for the rollback snapshot (COLD_BACKUP=always). Nothing was changed."
+      warn "Not enough disk left for the rollback snapshot; continuing without it (backup archive only)."
+      COLD_PLANNED=0
+    }
+    want_cold="$COLD_PLANNED"
+  fi
+
+  stop_mongod
+  if [[ "$want_cold" == "1" ]]; then
+    if ! take_cold_copy "$prev_ver" "$fcv_before"; then
+      warn "Rollback snapshot failed; starting mongod $prev_ver again without changes."
+      rm -rf "$RUN_DIR/cold"
+      start_mongod || die "mongod $prev_ver did not start again. See journalctl -u $MONGOD_SERVICE"
+      die "Could not take the rollback snapshot. Nothing was changed."
+    fi
+  fi
+  if ! install_mongodb_pkgs "$to_ver"; then
+    warn "Package installation failed"
+    rollback_binaries "$prev_ver" "$saved"; die "Upgrade to $to_ver failed; rolled back."
+  fi
+  # apt may replace the unit file; make sure systemd sees it.
+  systemctl daemon-reload
+  if ! start_mongod; then
+    warn "mongod $to_ver failed to start"
+    journalctl -u "$MONGOD_SERVICE" -n 60 --no-pager || true
+    rollback_binaries "$prev_ver" "$saved"; die "Upgrade to $to_ver failed; rolled back."
+  fi
+  local now; now="$(server_version)"
+  [[ "$now" == "$to_ver" ]] || { rollback_binaries "$prev_ver" "$saved"; die "Expected $to_ver, got $now; rolled back."; }
+  ok "mongod binaries upgraded: $prev_ver -> $now"
+}
+
+set_fcv() {
+  local target="$1" now
+  now="$(fcv)"
+  if [[ "$now" == "$target" ]]; then ok "FCV already $target"; return 0; fi
+  log "Setting featureCompatibilityVersion $now -> $target ..."
+  js "const r = db.adminCommand({setFeatureCompatibilityVersion: '$target', confirm: true});
+      if (r.ok !== 1) { printjson(r); quit(2); }"
+  now="$(fcv)"
+  [[ "$now" == "$target" ]] || die "FCV is $now after setting $target"
+  ok "FCV is now $target"
+}
+
+health_check() {
+  local v f st
+  v="$(server_version)"; f="$(fcv)"
+  st="$(js 'const s=db.adminCommand({replSetGetStatus:1}); print(Number(s.myState)===1 && s.members.every(m=>Number(m.health)===1) ? "HEALTHY" : "UNHEALTHY")')"
+  [[ "$st" == "HEALTHY" ]] || die "Replica set unhealthy after upgrade"
+  js "const r=db.getSiblingDB('$APP_DB').runCommand({ping:1}); if(r.ok!==1) quit(2);" \
+    || die "Database $APP_DB not reachable"
+  ok "Health: version $v, FCV $f, replica set healthy, $APP_DB reachable"
+}
+
+if [[ "$ROLLBACK" == "1" ]]; then
+  need_cmd mongosh || die "mongosh not found"
+  do_rollback   # exits
+fi
 
 # ----------------------------------------------------------------------------
 # Step 1: pre-flight
@@ -430,7 +758,7 @@ mapfile -t ORG_PKGS < <(dpkg-query -W -f='${Package} ${Status}\n' 'mongodb-org*'
   | awk '$NF=="installed"{print $1}' | grep -E '^mongodb-org(-server|-mongos|-database|-tools|-database-tools-extra|-shell)?$' || true)
 # Meta packages pin exact versions of their dependencies, so if any meta package
 # is installed we install the whole family explicitly at the same version.
-if printf '%s\n' "${ORG_PKGS[@]}" | grep -qxE 'mongodb-org|mongodb-org-database|mongodb-org-tools'; then
+if grep -qxE 'mongodb-org|mongodb-org-database|mongodb-org-tools' <<<"$(printf '%s\n' "${ORG_PKGS[@]}")"; then
   mapfile -t ORG_PKGS < <(printf '%s\n' "${ORG_PKGS[@]}" mongodb-org-server mongodb-org-mongos \
     mongodb-org-database-tools-extra mongodb-org-database mongodb-org-tools | grep -vx mongodb-org-shell | sort -u)
 fi
@@ -484,9 +812,31 @@ DB_FREE="$(df -B1 --output=avail "$DBPATH" | tail -1 | tr -d ' ')"
 (( DB_FREE > 2147483648 )) || die "Less than 2 GiB free on the dbPath filesystem; upgrade/startup could fail."
 ok "Disk space is sufficient"
 
+# Rollback snapshot plan (only matters when binaries will change).
+DBPATH_BYTES="$(du -sb "$DBPATH" | cut -f1)"
+if [[ "$(series_of "$CUR_VER")" != "$TARGET_SERIES" ]]; then
+  case "$COLD_BACKUP" in
+    never)
+      warn "Rollback snapshot disabled (COLD_BACKUP=never). After the FCV change the only way back is the backup archive." ;;
+    auto|always)
+      # snapshot + backup archive (upper bound: uncompressed data) + 1 GiB margin
+      COLD_NEED=$(( DBPATH_BYTES + DATA_BYTES + 1073741824 ))
+      if (( FREE_BYTES > COLD_NEED )); then
+        COLD_PLANNED=1
+        ok "Rollback snapshot: dbPath ($((DBPATH_BYTES/1048576)) MiB) will be copied while mongod is stopped; ROLLBACK=1 can then restore $CUR_VER exactly"
+      elif [[ "$COLD_BACKUP" == "always" ]]; then
+        die "Not enough disk for the rollback snapshot: need ~$((COLD_NEED/1048576)) MiB free on $BACKUP_ROOT, have $((FREE_BYTES/1048576)) MiB."
+      else
+        warn "Rollback snapshot NOT possible: needs ~$((COLD_NEED/1048576)) MiB free on $BACKUP_ROOT, have $((FREE_BYTES/1048576)) MiB."
+        warn "Set BACKUP_ROOT to a larger disk, or rely on an EBS/disk snapshot for rollback."
+      fi ;;
+    *) die "COLD_BACKUP must be auto, always or never" ;;
+  esac
+fi
+
 if [[ "$INSTALL_MONGOT" == "1" ]] && ! systemctl is-active --quiet mongot 2>/dev/null; then
   for p in "$MONGOT_GRPC_PORT" "$MONGOT_HEALTH_PORT" "$MONGOT_METRICS_PORT"; do
-    if ss -Hltn "sport = :$p" | grep -q .; then
+    if [[ -n "$(ss -Hltn "sport = :$p")" ]]; then
       die "Port $p is already in use (needed by mongot). Set MONGOT_GRPC_PORT/MONGOT_HEALTH_PORT/MONGOT_METRICS_PORT."
     fi
   done
@@ -534,11 +884,10 @@ ${C_B}About to migrate MongoDB on $(hostname)${C_0}
 mongod will be stopped and restarted several times: the application WILL see
 downtime. Stop or pause application writers first (e.g. pm2 stop) for a
 consistent backup. Raising the FCV is not reversible in place.
+Rollback snapshot: $( [[ "$COLD_PLANNED" == "1" ]] && echo "YES (ROLLBACK=1 restores $CUR_VER exactly)" || echo "NO (backup archive / disk snapshot only)")
 
 EOF
-  [[ -t 0 ]] || die "No terminal for confirmation. Re-run interactively or set ASSUME_YES=1."
-  read -r -p "Type MIGRATE to continue: " answer
-  [[ "$answer" == "MIGRATE" ]] || die "Aborted by user."
+  confirm_word MIGRATE
 fi
 
 # ----------------------------------------------------------------------------
@@ -597,134 +946,16 @@ if [[ "$ALREADY_DONE" == "0" ]]; then
 Backup taken $TS from MongoDB $CUR_VER (FCV $CUR_FCV), replica set $RS_NAME.
 Archive: $ARCHIVE  (sha256 in $ARCHIVE.sha256)
 
-Restore (onto a running, empty-or-disposable deployment; --drop replaces collections):
+Fastest full rollback (if this run took a rollback snapshot, see $RUN_DIR/cold):
+  sudo ROLLBACK=1 bash migrate-mongodb.sh     # add ROLLBACK_FROM=$RUN_DIR to pick this run
+
+Logical restore (onto a running, empty-or-disposable deployment; --drop replaces collections):
   mongorestore --uri '<root uri>' --gzip --archive='$ARCHIVE' --oplogReplay --drop
 
 Config files, keyfile and the previous mongod binary are in: $RUN_DIR/files
 EOF
   log "Restore instructions: $RUN_DIR/RESTORE.txt"
 fi
-
-# ----------------------------------------------------------------------------
-# Binary upgrade with automatic rollback (only valid while FCV is unchanged)
-# ----------------------------------------------------------------------------
-add_apt_repo() {
-  local series="$1"
-  if [[ ! -s "$APT_KEYRING" ]]; then
-    log "Importing MongoDB ${APT_KEY_SERIES} signing key"
-    export GNUPGHOME="$TMP_DIR/gnupg"; mkdir -p -m 700 "$GNUPGHOME"
-    curl -fsSL "https://pgp.mongodb.com/server-${APT_KEY_SERIES}.asc" | gpg --batch --yes --dearmor -o "$APT_KEYRING.tmp"
-    gpg --batch --show-keys --with-colons "$APT_KEYRING.tmp" 2>/dev/null \
-      | grep -q "$APT_KEY_FINGERPRINT" || { rm -f "$APT_KEYRING.tmp"; die "Signing key fingerprint mismatch"; }
-    mv "$APT_KEYRING.tmp" "$APT_KEYRING"; chmod 644 "$APT_KEYRING"
-  fi
-  echo "deb [ arch=amd64,arm64 signed-by=$APT_KEYRING ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/${series} multiverse" \
-    > "/etc/apt/sources.list.d/mongodb-org-${series}.list"
-  chmod 644 "/etc/apt/sources.list.d/mongodb-org-${series}.list"
-  apt_quiet update -o Dir::Etc::sourcelist="sources.list.d/mongodb-org-${series}.list" \
-    -o Dir::Etc::sourceparts="-" -o APT::Get::List-Cleanup="0" >/dev/null
-}
-
-install_mongodb_pkgs() {
-  local ver="$1" args=() p
-  for p in "${ORG_PKGS[@]}"; do
-    [[ "$p" == "mongodb-org-shell" ]] && continue   # legacy shell does not exist in 8.x
-    args+=("$p=$ver")
-  done
-  apt-mark unhold "${ORG_PKGS[@]}" >/dev/null 2>&1 || true
-  apt_quiet install --allow-downgrades --allow-change-held-packages "${args[@]}" || return 1
-  apt-mark hold "${args[@]%%=*}" >/dev/null || return 1
-}
-
-stop_mongod() {
-  log "Stopping ${MONGOD_SERVICE} cleanly ..."
-  # Clean shutdown through the server first (flushes, steps down), then systemd.
-  js_try 'db.adminCommand({shutdown: 1, timeoutSecs: 60})' >/dev/null
-  systemctl stop "$MONGOD_SERVICE" || true
-  local i
-  for i in $(seq 1 120); do systemctl is-active --quiet "$MONGOD_SERVICE" || break; sleep 1; done
-  systemctl is-active --quiet "$MONGOD_SERVICE" && die "mongod did not stop"
-  pgrep -x mongod >/dev/null && die "A mongod process is still running"
-  ok "mongod stopped"
-}
-
-start_mongod() {
-  systemctl reset-failed "$MONGOD_SERVICE" 2>/dev/null || true
-  systemctl start "$MONGOD_SERVICE"
-  wait_primary
-}
-
-rollback_binaries() {
-  local prev_ver="$1" saved_dir="$2"
-  warn "Rolling back mongod binaries to $prev_ver (FCV was not changed) ..."
-  systemctl stop "$MONGOD_SERVICE" || true
-  if apt-cache madison mongodb-org-server | awk '{print $3}' | grep -qx "$prev_ver" \
-     && install_mongodb_pkgs "$prev_ver"; then
-    ok "Reinstalled packages $prev_ver"
-  elif [[ -x "$saved_dir/mongod" ]]; then
-    warn "Package $prev_ver not available in apt; restoring the saved mongod binary."
-    install -m 755 "$saved_dir/mongod" "$(command -v mongod || echo /usr/bin/mongod)"
-    [[ -x "$saved_dir/mongos" ]] && install -m 755 "$saved_dir/mongos" /usr/bin/mongos
-  else
-    die "Rollback impossible: no saved binary. Restore from $RUN_DIR."
-  fi
-  start_mongod || die "mongod did not start after rollback. See journalctl -u $MONGOD_SERVICE"
-  ok "Rolled back to $(server_version)"
-}
-
-upgrade_binaries() {
-  local to_ver="$1" to_series; to_series="$(series_of "$1")"
-  local prev_ver; prev_ver="$(dpkg-query -W -f='${Version}' mongodb-org-server)"
-  local saved="$RUN_DIR/files/bin-$prev_ver"
-  if [[ ! -x "$saved/mongod" ]]; then mkdir -p "$saved"; cp -a "$(command -v mongod)" "$saved/"; fi
-
-  log "Adding apt repository mongodb-org/$to_series"
-  add_apt_repo "$to_series"
-
-  # Pre-download everything while mongod is still running, to keep downtime short.
-  log "Downloading packages $to_ver ..."
-  local args=() p
-  for p in "${ORG_PKGS[@]}"; do [[ "$p" == "mongodb-org-shell" ]] || args+=("$p=$to_ver"); done
-  apt_quiet install --download-only --allow-change-held-packages "${args[@]}" >/dev/null
-
-  stop_mongod
-  if ! install_mongodb_pkgs "$to_ver"; then
-    warn "Package installation failed"
-    rollback_binaries "$prev_ver" "$saved"; die "Upgrade to $to_ver failed; rolled back."
-  fi
-  # apt may replace the unit file; make sure systemd sees it.
-  systemctl daemon-reload
-  if ! start_mongod; then
-    warn "mongod $to_ver failed to start"
-    journalctl -u "$MONGOD_SERVICE" -n 60 --no-pager || true
-    rollback_binaries "$prev_ver" "$saved"; die "Upgrade to $to_ver failed; rolled back."
-  fi
-  local now; now="$(server_version)"
-  [[ "$now" == "$to_ver" ]] || { rollback_binaries "$prev_ver" "$saved"; die "Expected $to_ver, got $now; rolled back."; }
-  ok "mongod binaries upgraded: $prev_ver -> $now"
-}
-
-set_fcv() {
-  local target="$1" now
-  now="$(fcv)"
-  if [[ "$now" == "$target" ]]; then ok "FCV already $target"; return 0; fi
-  log "Setting featureCompatibilityVersion $now -> $target ..."
-  js "const r = db.adminCommand({setFeatureCompatibilityVersion: '$target', confirm: true});
-      if (r.ok !== 1) { printjson(r); quit(2); }"
-  now="$(fcv)"
-  [[ "$now" == "$target" ]] || die "FCV is $now after setting $target"
-  ok "FCV is now $target"
-}
-
-health_check() {
-  local v f st
-  v="$(server_version)"; f="$(fcv)"
-  st="$(js 'const s=db.adminCommand({replSetGetStatus:1}); print(Number(s.myState)===1 && s.members.every(m=>Number(m.health)===1) ? "HEALTHY" : "UNHEALTHY")')"
-  [[ "$st" == "HEALTHY" ]] || die "Replica set unhealthy after upgrade"
-  js "const r=db.getSiblingDB('$APP_DB').runCommand({ping:1}); if(r.ok!==1) quit(2);" \
-    || die "Database $APP_DB not reachable"
-  ok "Health: version $v, FCV $f, replica set healthy, $APP_DB reachable"
-}
 
 # ----------------------------------------------------------------------------
 # Steps 4 & 5: version upgrades (resumable state machine)
@@ -825,7 +1056,7 @@ install_mongot() {
     mkdir -p "$TMP_DIR/mongot-x"
     tar -xzf "$tgz" -C "$TMP_DIR/mongot-x"
     # The shallowest file named "mongot" is the launcher script.
-    local launcher; launcher="$(find "$TMP_DIR/mongot-x" -maxdepth 3 -type f -name mongot -printf '%d %p\n' | sort -n | head -1 | cut -d' ' -f2-)"
+    local launcher; launcher="$(find "$TMP_DIR/mongot-x" -maxdepth 3 -type f -name mongot -printf '%d %p\n' | sort -n | sed -n 1p | cut -d' ' -f2-)"
     [[ -n "$launcher" ]] || die "mongot launcher not found in tarball"
     mkdir -p "$MONGOT_HOME"
     rm -rf "$dest"; cp -a "$(dirname "$launcher")" "$dest"
@@ -855,7 +1086,7 @@ install_mongot() {
 
   # Start from the config.default.yml shipped in the tarball (so the layout is
   # exactly what this mongot version expects) and only replace our values.
-  local default_cfg; default_cfg="$(find "$dest" -maxdepth 2 -name 'config.default.yml' | head -1)"
+  local default_cfg; default_cfg="$(find "$dest" -maxdepth 2 -name 'config.default.yml' | sed -n 1p)"
   MG_HOST="$host_port" MG_USER="$MONGOT_USER_DB" MG_PWFILE="$pwfile" MG_DATA="$MONGOT_DATA" \
   MG_GRPC="localhost:$MONGOT_GRPC_PORT" MG_METRICS="localhost:$MONGOT_METRICS_PORT" \
   MG_HEALTH="localhost:$MONGOT_HEALTH_PORT" \
@@ -1024,4 +1255,7 @@ printf '%-28s %s\n' "featureCompatibilityVersion:" "$(fcv)"
 printf '%-28s %s\n' "Replica set enabled:" "yes ($RS_NAME, $(js 'print(db.adminCommand({replSetGetStatus:1}).members[0].stateStr)'))"
 [[ "$INSTALL_MONGOT" == "1" ]] && printf '%-28s %s\n' "mongot:" "$(systemctl is-active mongot) ($(curl -s "http://localhost:$MONGOT_HEALTH_PORT/health"))"
 printf '%-28s %s\n' "Backup / logs:" "$RUN_DIR"
+if [[ -f "$RUN_DIR/cold/.complete" ]]; then
+  printf '%-28s %s\n' "Rollback snapshot:" "$RUN_DIR/cold (sudo ROLLBACK=1 bash $0 to go back)"
+fi
 ok "Migration finished successfully."

@@ -59,6 +59,29 @@ Before you run it:
 
 What the script does: pre-flight checks → before report → verified `mongodump --oplog` backup (plus copies of the config, keyfile and binaries) → upgrade to 8.0 → FCV 8.0 → upgrade to 8.3 → FCV 8.3 → mongot as a systemd service with a `searchCoordinator` user → after report → count comparison.
 
-If a binary upgrade fails before the FCV is raised, the previous binaries are restored automatically. Once the FCV is raised there is no in-place downgrade: recovery means restoring the backup (see `RESTORE.txt` in the run directory). The script is resumable, so after fixing a failure you can run it again.
+## If something goes wrong: rollback
+
+| When it fails | What happens |
+|---|---|
+| Before the first binary change (pre-flight, backup, restore test) | Nothing has been changed. Fix the cause and run again. |
+| While installing or starting 8.0 / 8.3, **before** the FCV is raised | The script puts the previous binaries back automatically and restarts mongod. |
+| Anywhere **after** the FCV is raised (or you simply want to go back) | Run `sudo ROLLBACK=1 bash migrate-mongodb.sh` |
+
+**The rollback snapshot.** Before the first binary change, mongod is stopped anyway. At that point the script copies the whole `dbPath` (`COLD_BACKUP=auto`, the default). The copy contains all data, users, passwords, indexes and the replica set config, exactly as they were.
+
+**`ROLLBACK=1` restores production exactly as it was before the migration** (for example 7.0.42):
+
+1. Stops and disables mongot, then stops mongod.
+2. Moves the current `dbPath` aside (it is never deleted) and puts the snapshot in its place.
+3. Restores the saved `mongod`/`mongos` binaries and the original `mongod.conf` byte for byte.
+4. Starts mongod. It then checks the version, FCV, replica set, login with the **same connection string**, and every collection's document and index counts against the snapshot.
+
+It asks you to type `ROLLBACK` first. Before that it shows which data differs from the snapshot, because anything written after the snapshot is not in the rolled-back database; that data stays in the moved-aside folder. CI tests the full path: migrate to 8.3 with mongot, then roll back to 7.0 and verify.
+
+The snapshot needs free disk equal to the `dbPath` size, on top of the backup archive. `CHECK_ONLY=1` reports whether this is possible. If space is short, the script warns and continues without a snapshot; `COLD_BACKUP=always` makes it stop instead. In that case, use `BACKUP_ROOT` on a bigger disk or rely on the EBS snapshot.
+
+After a rollback, apt still lists the newer packages as installed and held, while the binaries are the saved originals. Keep the packages held and don't run apt upgrades of mongodb-org until you migrate again.
+
+The script is also resumable: after fixing a failure, running it again continues where it stopped.
 
 Everything for a run is written to `/var/backups/mongodb-migration/<timestamp>/`, readable by root only.
