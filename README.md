@@ -42,6 +42,7 @@ Before you run it:
 - **Downtime:** mongod restarts 3 times (8.0, 8.3, then search parameters). Stop the app writers first (`pm2 stop ...`) so the backup is consistent and the count comparison is exact.
 - **Memory:** mongot is a JVM process and keeps the vector index in memory. The server already uses 1.4 GB of swap, so watch memory after enabling it.
 - **Ports:** mongot uses 27028 (gRPC), 8080 (health) and 9946 (metrics), all on localhost. The script stops if any of them is already taken. Override them with `MONGOT_*_PORT`.
+- **Backup verification:** the script checks the dump log against the live collections. It also restores the whole archive into a temporary mongod on a local port and compares every collection's document and index counts. That restore test needs about (data + indexes + 1 GiB) of free disk. With the default `VERIFY_RESTORE=auto` it is skipped with a warning when space is short; `always` makes it mandatory and `never` turns it off.
 - Take an EBS/disk snapshot as well. The script's `mongodump` is a logical backup; a snapshot is the fastest way back.
 
 What the script does: pre-flight checks → before report → verified `mongodump --oplog` backup (plus copies of the config, keyfile and binaries) → upgrade to 8.0 → FCV 8.0 → upgrade to 8.3 → FCV 8.3 → mongot as a systemd service with a `searchCoordinator` user → after report → count comparison.

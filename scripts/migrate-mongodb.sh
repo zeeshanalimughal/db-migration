@@ -47,6 +47,8 @@
 #   APP_DB=<db from URI, else workmentor>   USERS_COLLECTION=users
 #   MONGOD_SERVICE=mongod      ASSUME_YES=0 (1 = no confirmation prompt)
 #   STRICT_COUNTS=0 (1 = fail if any collection count changed)
+#   VERIFY_RESTORE=auto (restore the backup into a temporary mongod and compare
+#                        counts when disk allows; always = required; never = skip)
 #   MONGOT_GRPC_PORT=27028 MONGOT_HEALTH_PORT=8080 MONGOT_METRICS_PORT=9946
 # =============================================================================
 
@@ -69,6 +71,7 @@ MONGOT_GRPC_PORT="${MONGOT_GRPC_PORT:-27028}"
 MONGOT_HEALTH_PORT="${MONGOT_HEALTH_PORT:-8080}"
 MONGOT_METRICS_PORT="${MONGOT_METRICS_PORT:-9946}"
 START_TIMEOUT="${START_TIMEOUT:-900}"   # seconds to wait for mongod to become PRIMARY
+VERIFY_RESTORE="${VERIFY_RESTORE:-auto}" # auto | always | never  (full restore test of the backup)
 
 TARGET_SERIES="${TARGET_VERSION%.*}"            # 8.3
 INTERMEDIATE_SERIES="${INTERMEDIATE_VERSION%.*}" # 8.0
@@ -105,7 +108,11 @@ on_error() {
   printf 'The script is resumable: fix the cause and run it again.\n' >&2
 }
 trap 'on_error $LINENO' ERR
-cleanup() { [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"; return 0; }
+cleanup() {
+  stop_restore_mongod 2>/dev/null || true
+  [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
+  return 0
+}
 trap cleanup EXIT
 
 # ----------------------------------------------------------------------------
@@ -119,13 +126,17 @@ if [[ -z "$MIG_URI" ]]; then
 fi
 [[ -n "$MIG_URI" ]] || die "No MongoDB URI given (argument, \$MONGO_URI or prompt)."
 [[ "$MIG_URI" =~ ^mongodb(\+srv)?:// ]] || die "The URI must start with mongodb:// or mongodb+srv://"
-export MIG_URI
+# Not exported: only mongosh (via js_uri) and the 0600 tools config ever see it.
+export -n MONGO_URI 2>/dev/null || true
 unset MONGO_URI
 
 # ----------------------------------------------------------------------------
 # Root, OS and lock
 # ----------------------------------------------------------------------------
 [[ $EUID -eq 0 ]] || die "Run as root: sudo $0  (use sudo -E if you pass \$MONGO_URI)."
+# `sudo -E` keeps the caller's HOME; mongosh/gpg would then leave root-owned
+# files in that user's home directory. Use root's own home.
+HOME="$(getent passwd root | cut -d: -f6)"; export HOME
 # shellcheck disable=SC1091
 . /etc/os-release
 [[ "${ID:-}" == "ubuntu" && "${VERSION_CODENAME:-}" == "jammy" ]] \
@@ -148,12 +159,15 @@ log "Target: MongoDB $TARGET_VERSION (via $INTERMEDIATE_VERSION), mongot $MONGOT
 # ----------------------------------------------------------------------------
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-# js <script>: run JS against the URI. `db` is the URI's database.
-js() {
-  mongosh --nodb --quiet --norc --eval "
-    try { db = connect(process.env.MIG_URI); } catch (e) { print('CONNECT_ERROR: ' + e.message); quit(3); }
-    $1"
+# js_uri <uri> <script>: run JS against <uri>; `db` is the URI's database.
+# The URI is handed to mongosh through its environment, never on the command line.
+js_uri() {
+  MIG_CONNECT_URI="$1" mongosh --nodb --quiet --norc --eval "
+    try { db = connect(process.env.MIG_CONNECT_URI); } catch (e) { print('CONNECT_ERROR: ' + e.message); quit(3); }
+    $2"
 }
+# js <script>: run JS against the migration URI.
+js() { js_uri "$MIG_URI" "$1"; }
 # js_try: like js, but never trips the ERR trap (for polling).
 js_try() { js "$1" 2>/dev/null || true; }
 
@@ -183,9 +197,11 @@ write_tools_cfg() {
   chmod 600 "$TOOLS_CFG"
 }
 
+# apt/dpkg run with the normal 022 umask (the script's 077 is only for our own files).
 apt_quiet() {
-  DEBIAN_FRONTEND=noninteractive apt-get -y -q \
-    -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef "$@"
+  ( umask 022
+    DEBIAN_FRONTEND=noninteractive apt-get -y -q \
+      -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef "$@" )
 }
 
 # ----------------------------------------------------------------------------
@@ -252,6 +268,7 @@ print_report() {
   APP_DB="$APP_DB" USERS_COLLECTION="$USERS_COLLECTION" js "$REPORT_JS" | tee "$RUN_DIR/report-$(echo "$title" | tr ' A-Z' '-a-z').json"
 }
 
+# One line per collection: "<db.collection>\t<documents>\t<indexes>", sorted.
 COUNTS_JS='
 const res = {};
 db.adminCommand({listDatabases:1, nameOnly:true}).databases.forEach(d => {
@@ -260,12 +277,95 @@ db.adminCommand({listDatabases:1, nameOnly:true}).databases.forEach(d => {
   const sdb = db.getSiblingDB(d.name);
   sdb.getCollectionInfos({type:"collection"}).forEach(ci => {
     if (ci.name.startsWith("system.") || ci.name.startsWith("__mdb")) return;
-    res[d.name + "." + ci.name] = sdb.getCollection(ci.name).countDocuments({});
+    const c = sdb.getCollection(ci.name);
+    res[d.name + "." + ci.name] = c.countDocuments({}) + "\t" + c.getIndexes().length;
   });
 });
 Object.keys(res).sort().forEach(k => print(k + "\t" + res[k]));
 '
 snapshot_counts() { js "$COUNTS_JS" > "$1"; }
+
+# ----------------------------------------------------------------------------
+# Backup verification
+# ----------------------------------------------------------------------------
+STABLE=0
+RESTORE_PID_FILE=""
+
+# mongodump logs "done dumping `db.coll` (N documents)"; older tools omit the
+# backticks. Output: "<ns>\t<N>" per collection.
+parse_dump_log() {
+  sed -nE 's/.*done dumping `?([^` ]+)`? \(([0-9]+) documents?\).*/\1\t\2/p' "$1" | sort -u
+}
+
+verify_dump_log() {
+  log "Checking the dump log against the live collections ..."
+  parse_dump_log "$RUN_DIR/dump/mongodump.log" > "$RUN_DIR/counts-dumped.tsv"
+  [[ -s "$RUN_DIR/counts-dumped.tsv" ]] || die "Could not read any 'done dumping' line from mongodump.log"
+  local bad=0 ns cnt _idx dumped
+  while IFS=$'\t' read -r ns cnt _idx; do
+    dumped="$(awk -F'\t' -v n="$ns" '$1==n{print $2}' "$RUN_DIR/counts-dumped.tsv")"
+    if [[ -z "$dumped" ]]; then
+      if [[ "$cnt" == "0" ]]; then warn "Empty collection $ns not listed by mongodump"; else warn "Missing from the dump: $ns"; bad=1; fi
+    elif [[ "$STABLE" == "1" && "$dumped" != "$cnt" ]]; then
+      warn "$ns: $cnt documents live, $dumped dumped"; bad=1
+    fi
+  done < "$RUN_DIR/counts-before.tsv"
+  [[ "$bad" == "0" ]] || die "Backup verification failed: the dump does not match the live data. Nothing was changed."
+  ok "Dump log lists all $(wc -l < "$RUN_DIR/counts-before.tsv") collections with matching document counts"
+}
+
+stop_restore_mongod() {
+  [[ -n "$RESTORE_PID_FILE" && -s "$RESTORE_PID_FILE" ]] || return 0
+  local pid i; pid="$(cat "$RESTORE_PID_FILE")"
+  kill -TERM "$pid" 2>/dev/null || true
+  for i in $(seq 1 60); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+  kill -KILL "$pid" 2>/dev/null || true
+  rm -f "$RESTORE_PID_FILE"
+  return 0
+}
+
+# Restores the whole archive into a throw-away mongod (current binary, random
+# local port, no auth, small cache) and compares every collection's document
+# and index counts with the live server.
+restore_test() {
+  local archive="$1" tdir="$RUN_DIR/restore-test" port="" p
+  for p in $(seq 27090 27099); do
+    ss -Hltn "sport = :$p" | grep -q . || { port="$p"; break; }
+  done
+  [[ -n "$port" ]] || { warn "No free port in 27090-27099 for the restore test"; return 1; }
+  rm -rf "$tdir"; mkdir -p "$tdir/db"
+  RESTORE_PID_FILE="$tdir/mongod.pid"
+  log "Restore test: temporary mongod on 127.0.0.1:$port ..."
+  "$(command -v mongod)" --dbpath "$tdir/db" --port "$port" --bind_ip 127.0.0.1 --fork \
+    --logpath "$tdir/mongod.log" --pidfilepath "$RESTORE_PID_FILE" --wiredTigerCacheSizeGB 0.25 \
+    --setParameter diagnosticDataCollectionEnabled=false >/dev/null 2>&1 9>&- \
+    || { tail -20 "$tdir/mongod.log"; return 1; }
+  local turi="mongodb://127.0.0.1:$port/?directConnection=true"
+  log "Restore test: mongorestore --oplogReplay of the full archive ..."
+  if ! mongorestore --uri "$turi" --gzip --archive="$archive" --oplogReplay --nsExclude 'config.*' \
+        2>"$tdir/restore.log" 9>&-; then
+    tail -20 "$tdir/restore.log"; stop_restore_mongod; return 1
+  fi
+  grep -E 'document\(s\) (restored successfully|failed to restore)' "$tdir/restore.log" | tail -1 || true
+  if grep -qE '(^|[^0-9])[1-9][0-9]* document\(s\) failed to restore' "$tdir/restore.log"; then
+    warn "Some documents failed to restore"; stop_restore_mongod; return 1
+  fi
+  js_uri "$turi" "$COUNTS_JS" > "$RUN_DIR/counts-restored.tsv" || { stop_restore_mongod; return 1; }
+  stop_restore_mongod
+  rm -rf "$tdir/db"
+
+  if [[ "$STABLE" == "1" ]]; then
+    if ! diff -u "$RUN_DIR/counts-before.tsv" "$RUN_DIR/counts-restored.tsv"; then
+      warn "Restored data differs from the live data (columns: namespace, documents, indexes)"; return 1
+    fi
+    ok "Restore test passed: all $(wc -l < "$RUN_DIR/counts-restored.tsv") collections restored with identical document and index counts"
+  else
+    if ! diff -u <(cut -f1,3 "$RUN_DIR/counts-before.tsv") <(cut -f1,3 "$RUN_DIR/counts-restored.tsv"); then
+      warn "Restored collections/indexes differ from the live server"; return 1
+    fi
+    ok "Restore test passed: all collections and indexes restored (document counts moved because of live writes)"
+  fi
+}
 
 # ----------------------------------------------------------------------------
 # Step 1: pre-flight
@@ -276,6 +376,11 @@ need_cmd mongosh || die "mongosh not found. Install it first: apt-get install mo
 need_cmd curl    || apt_quiet install curl
 need_cmd gpg     || apt_quiet install gnupg
 need_cmd flock   || die "flock missing (util-linux)"
+need_cmd python3 || die "python3 is required (YAML validation of mongod.conf / mongot config)"
+if ! python3 -c 'import yaml' 2>/dev/null; then
+  log "Installing python3-yaml (used to validate config files)"
+  apt_quiet install python3-yaml >/dev/null
+fi
 
 conn="$(js 'print("CONNECTED")' 2>&1 || true)"
 [[ "$conn" == *CONNECTED* ]] || die "Cannot connect/authenticate with the given URI: ${conn//"$MIG_URI"/<uri>}"
@@ -355,7 +460,8 @@ esac
 
 # Disk space for the backup: uncompressed data size + 1 GiB margin (gzip usually
 # shrinks it a lot, so this is conservative).
-DATA_BYTES="$(js 'let t=0; db.adminCommand({listDatabases:1}).databases.forEach(d=>{ if(d.name!=="local") t+=Number(db.getSiblingDB(d.name).stats().dataSize); }); print(Math.ceil(t))')"
+read -r DATA_BYTES INDEX_BYTES < <(js 'let t=0, i=0; db.adminCommand({listDatabases:1}).databases.forEach(d=>{ if(d.name!=="local"){ const s=db.getSiblingDB(d.name).stats(); t+=Number(s.dataSize); i+=Number(s.indexSize); } }); print(Math.ceil(t) + " " + Math.ceil(i))')
+[[ "$DATA_BYTES" =~ ^[0-9]+$ && "$INDEX_BYTES" =~ ^[0-9]+$ ]] || die "Could not read database sizes"
 FREE_BYTES="$(df -B1 --output=avail "$BACKUP_ROOT" | tail -1 | tr -d ' ')"
 NEED_BYTES=$(( DATA_BYTES + 1073741824 ))
 log "Data size: $((DATA_BYTES/1048576)) MiB; free on $(df --output=target "$BACKUP_ROOT" | tail -1): $((FREE_BYTES/1048576)) MiB"
@@ -430,20 +536,33 @@ if [[ "$ALREADY_DONE" == "0" ]]; then
   log "mongodump of all databases with --oplog (point-in-time consistent) ..."
   mongodump --config="$TOOLS_CFG" --oplog --gzip --archive="$ARCHIVE" 2>"$RUN_DIR/dump/mongodump.log" \
     || { tail -20 "$RUN_DIR/dump/mongodump.log"; die "mongodump failed"; }
-  tail -3 "$RUN_DIR/dump/mongodump.log"
   [[ -s "$ARCHIVE" ]] || die "Backup archive is empty"
   sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
+  ok "Archive written: $ARCHIVE ($(du -h "$ARCHIVE" | cut -f1))"
 
-  log "Verifying the archive with mongorestore --dryRun ..."
-  mongorestore --config="$TOOLS_CFG" --gzip --archive="$ARCHIVE" --dryRun --objcheck -v 2>"$RUN_DIR/dump/verify.log" \
-    || { tail -20 "$RUN_DIR/dump/verify.log"; die "Backup verification failed"; }
-  # Every non-system collection with documents must have been dumped.
-  missing=0
-  while IFS=$'\t' read -r ns cnt; do
-    [[ "$cnt" == "0" ]] && continue
-    grep -qF "done dumping $ns " "$RUN_DIR/dump/mongodump.log" || { warn "Not found in mongodump output: $ns"; missing=1; }
-  done < "$RUN_DIR/counts-before.tsv"
-  [[ "$missing" == "0" ]] || die "Backup verification: some collections are missing from the archive."
+  # Did anything write while we were dumping? (decides exact vs. tolerant checks)
+  snapshot_counts "$RUN_DIR/counts-post-dump.tsv"
+  if cmp -s "$RUN_DIR/counts-before.tsv" "$RUN_DIR/counts-post-dump.tsv"; then
+    STABLE=1; log "No writes during the dump: verification will require exact counts."
+  else
+    STABLE=0; warn "Data changed during the dump (application still writing?). Counts are compared loosely."
+  fi
+
+  verify_dump_log
+  case "$VERIFY_RESTORE" in
+    never) warn "Full restore test skipped (VERIFY_RESTORE=never)." ;;
+    always|auto)
+      RESTORE_FREE="$(df -B1 --output=avail "$RUN_DIR" | tail -1 | tr -d ' ')"
+      RESTORE_NEED=$(( DATA_BYTES + INDEX_BYTES + 1073741824 ))
+      if (( RESTORE_FREE > RESTORE_NEED )); then
+        restore_test "$ARCHIVE" || die "Restore test failed: the backup is not trustworthy. Nothing was changed."
+      elif [[ "$VERIFY_RESTORE" == "always" ]]; then
+        die "Not enough disk for the restore test (need ~$((RESTORE_NEED/1048576)) MiB free)."
+      else
+        warn "Full restore test skipped: needs ~$((RESTORE_NEED/1048576)) MiB free, have $((RESTORE_FREE/1048576)) MiB. The dump log check passed; consider a disk snapshot too."
+      fi ;;
+    *) die "VERIFY_RESTORE must be auto, always or never" ;;
+  esac
 
   cp -a "$CONF" "$RUN_DIR/files/"
   [[ -n "$KEYFILE" && -f "$KEYFILE" ]] && cp -a "$KEYFILE" "$RUN_DIR/files/"
@@ -472,6 +591,7 @@ add_apt_repo() {
   local series="$1"
   if [[ ! -s "$APT_KEYRING" ]]; then
     log "Importing MongoDB ${APT_KEY_SERIES} signing key"
+    export GNUPGHOME="$TMP_DIR/gnupg"; mkdir -p -m 700 "$GNUPGHOME"
     curl -fsSL "https://pgp.mongodb.com/server-${APT_KEY_SERIES}.asc" | gpg --batch --yes --dearmor -o "$APT_KEYRING.tmp"
     gpg --batch --show-keys --with-colons "$APT_KEYRING.tmp" 2>/dev/null \
       | grep -q "$APT_KEY_FINGERPRINT" || { rm -f "$APT_KEYRING.tmp"; die "Signing key fingerprint mismatch"; }
@@ -640,20 +760,27 @@ ensure_mongod_search_params() {
         || die "mongod.conf already sets $key to a different value; fix it manually."
       continue
     fi
-    # Insert right after the top-level `setParameter:` line.
-    awk -v line="${indent}${key}: ${val}" '{print} /^setParameter:[[:space:]]*$/{print line}' "$new" > "$new.tmp" && mv "$new.tmp" "$new"
+    # Insert right after the top-level `setParameter:` line (a trailing comment is allowed).
+    awk -v line="${indent}${key}: ${val}" '{print} /^setParameter:[[:space:]]*(#.*)?$/{print line}' "$new" > "$new.tmp" && mv "$new.tmp" "$new"
     changed=1
   done
   if (( changed )); then
-    # Validate the edited file parses as YAML before installing it.
-    if need_cmd python3 && python3 -c 'import yaml' 2>/dev/null; then
-      python3 - "$new" <<'PY' || die "Edited mongod.conf is not valid YAML; original left untouched."
+    # Prove the edit is safe before installing it: valid YAML, nothing outside
+    # setParameter changed, existing parameters kept, new ones present.
+    python3 - "$conf" "$new" <<'PY' || die "Edited mongod.conf failed validation; the original was left untouched."
 import sys, yaml
-c = yaml.safe_load(open(sys.argv[1]))
-sp = c.get("setParameter") or {}
-assert sp.get("useGrpcForSearch") is True and sp.get("mongotHost"), sp
+old = yaml.safe_load(open(sys.argv[1])) or {}
+new = yaml.safe_load(open(sys.argv[2])) or {}
+sp_old = old.pop("setParameter", None) or {}
+sp_new = new.pop("setParameter", None) or {}
+assert old == new, "settings outside setParameter changed"
+for k, v in sp_old.items():
+    assert sp_new.get(k) == v, "existing setParameter %s changed" % k
+assert sp_new.get("useGrpcForSearch") is True, "useGrpcForSearch"
+assert sp_new.get("skipAuthenticationToSearchIndexManagementServer") is False, "skipAuthentication..."
+assert sp_new.get("mongotHost") and sp_new.get("mongotHost") == sp_new.get("searchIndexManagementHostAndPort"), "hosts"
+print("mongod.conf setParameter:", sp_new)
 PY
-    fi
     chown --reference="$conf" "$new"; chmod --reference="$conf" "$new"
     cat "$new" > "$conf"
     log "Added search setParameters to $conf"
@@ -681,7 +808,10 @@ install_mongot() {
     [[ -n "$launcher" ]] || die "mongot launcher not found in tarball"
     mkdir -p "$MONGOT_HOME"
     rm -rf "$dest"; cp -a "$(dirname "$launcher")" "$dest"
-    chown -R root:root "$dest"; chmod -R go-w "$dest"; chmod 755 "$MONGOT_HOME" "$dest"
+    # Root-owned, readable/executable by the mongot user, writable by nobody else.
+    chown -R root:root "$dest"; chmod -R u+rwX,go+rX,go-w "$dest"; chmod 755 "$MONGOT_HOME"
+    [[ -x "$dest/mongot" ]] || chmod 755 "$dest/mongot"
+    log "mongot installed in $dest: $(ls "$dest" | tr '\n' ' ')"
   fi
   ln -sfn "$dest" "$MONGOT_HOME/current"
 
@@ -702,31 +832,76 @@ install_mongot() {
   chown mongot:mongot "$pwfile"; chmod 400 "$pwfile"
   ok "User $MONGOT_USER_DB (searchCoordinator) ready; password in $pwfile"
 
-  cat > "$MONGOT_ETC/mongot.yml" <<EOF
-syncSource:
-  replicaSet:
-    hostAndPort: "$host_port"
-    scramAuth:
-      username: $MONGOT_USER_DB
-      authSource: admin
-      passwordFile: "$pwfile"
-    tls:
-      enabled: false
-storage:
-  dataPath: "$MONGOT_DATA"
-server:
-  grpc:
-    address: "localhost:$MONGOT_GRPC_PORT"
-    tls:
-      mode: "disabled"
-metrics:
-  enabled: true
-  address: "localhost:$MONGOT_METRICS_PORT"
-healthCheck:
-  address: "localhost:$MONGOT_HEALTH_PORT"
-logging:
-  verbosity: INFO
-EOF
+  # Start from the config.default.yml shipped in the tarball (so the layout is
+  # exactly what this mongot version expects) and only replace our values.
+  local default_cfg; default_cfg="$(find "$dest" -maxdepth 2 -name 'config.default.yml' | head -1)"
+  MG_HOST="$host_port" MG_USER="$MONGOT_USER_DB" MG_PWFILE="$pwfile" MG_DATA="$MONGOT_DATA" \
+  MG_GRPC="localhost:$MONGOT_GRPC_PORT" MG_METRICS="localhost:$MONGOT_METRICS_PORT" \
+  MG_HEALTH="localhost:$MONGOT_HEALTH_PORT" \
+  python3 - "${default_cfg:-}" "$MONGOT_ETC/mongot.yml" <<'PY' || die "Could not build the mongot config"
+import os, sys, yaml
+src, dst = sys.argv[1], sys.argv[2]
+E = os.environ
+cfg = None
+if src and os.path.isfile(src):
+    cfg = yaml.safe_load(open(src))
+    print("mongot config based on", src)
+if not isinstance(cfg, dict):
+    print("mongot config: tarball default not found, using the documented layout")
+    cfg = {
+        "syncSource": {"replicaSet": {
+            "hostAndPort": "x", "scramAuth": {"username": "x", "authSource": "admin", "passwordFile": "x"},
+            "tls": {"enabled": False}}},
+        "storage": {"dataPath": "x"},
+        "server": {"grpc": {"address": "x", "tls": {"mode": "disabled"}}},
+        "metrics": {"enabled": True, "address": "x"},
+        "healthCheck": {"address": "x"},
+        "logging": {"verbosity": "INFO"},
+    }
+
+def walk_set(node, key, value):
+    """Set every occurrence of key below node; returns how many were set."""
+    n = 0
+    if isinstance(node, dict):
+        for k in list(node):
+            if k == key:
+                node[k] = value(node[k]) if callable(value) else value
+                n += 1
+            else:
+                n += walk_set(node[k], key, value)
+    elif isinstance(node, list):
+        for item in node:
+            n += walk_set(item, key, value)
+    return n
+
+def need(ok, what):
+    if not ok:
+        sys.exit("mongot config: could not find '%s' in the default config" % what)
+
+ss = cfg.get("syncSource")
+need(isinstance(ss, dict), "syncSource")
+need(walk_set(ss, "hostAndPort", lambda old: [E["MG_HOST"]] if isinstance(old, list) else E["MG_HOST"]), "hostAndPort")
+need(walk_set(ss, "username", E["MG_USER"]), "username")
+need(walk_set(ss, "passwordFile", E["MG_PWFILE"]), "passwordFile")
+walk_set(ss, "authSource", "admin")
+# mongot and mongod are on the same host: no TLS on that link.
+walk_set(ss, "tls", lambda old: dict(old, enabled=False) if isinstance(old, dict) else False)
+
+cfg.setdefault("storage", {})["dataPath"] = E["MG_DATA"]
+grpc = cfg.setdefault("server", {}).setdefault("grpc", {})
+grpc["address"] = E["MG_GRPC"]
+if isinstance(grpc.get("tls"), dict):
+    grpc["tls"]["mode"] = "disabled"
+cfg.setdefault("metrics", {}).update({"enabled": True, "address": E["MG_METRICS"]})
+cfg.setdefault("healthCheck", {})["address"] = E["MG_HEALTH"]
+logging_cfg = cfg.get("logging")
+if isinstance(logging_cfg, dict):
+    logging_cfg.pop("logPath", None)   # log to stdout -> journald
+
+with open(dst, "w") as f:
+    yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=False)
+print(yaml.safe_dump(cfg, default_flow_style=False, sort_keys=False))
+PY
   chown root:mongot "$MONGOT_ETC/mongot.yml"; chmod 640 "$MONGOT_ETC/mongot.yml"
 
   cat > /etc/systemd/system/mongot.service <<EOF
@@ -752,6 +927,7 @@ ReadWritePaths=$MONGOT_DATA
 [Install]
 WantedBy=multi-user.target
 EOF
+  chmod 644 /etc/systemd/system/mongot.service
   systemctl daemon-reload
   systemctl enable mongot >/dev/null 2>&1
   systemctl restart mongot

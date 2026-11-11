@@ -56,7 +56,8 @@ jobs:
         run: mongosh --quiet "$MONGO_URI" ci/query.js
 
       - name: Run the migration script
-        run: sudo -E env ASSUME_YES=1 STRICT_COUNTS=1 bash scripts/migrate-mongodb.sh
+        # VERIFY_RESTORE=always: the backup must pass a full restore test in CI.
+        run: sudo -E env ASSUME_YES=1 STRICT_COUNTS=1 VERIFY_RESTORE=always bash scripts/migrate-mongodb.sh
 
       - name: Query AFTER migration
         run: mongosh --quiet "$MONGO_URI" ci/query.js
@@ -97,7 +98,10 @@ jobs:
         if: always()
         run: |
           mkdir -p ci-logs
-          sudo bash -c 'for d in /var/backups/mongodb-migration/*/; do n=$(basename "$d"); mkdir -p ci-logs/$n; cp "$d"/*.log "$d"/*.json "$d"/*.tsv "$d"/RESTORE.txt ci-logs/$n/ 2>/dev/null; cp "$d"/dump/*.log ci-logs/$n/ 2>/dev/null; done; true'
+          sudo bash -c 'for d in /var/backups/mongodb-migration/*/; do n=$(basename "$d"); mkdir -p ci-logs/$n; cp "$d"/*.log "$d"/*.json "$d"/*.tsv "$d"/*.diff "$d"/RESTORE.txt ci-logs/$n/ 2>/dev/null; cp "$d"/dump/*.log ci-logs/$n/ 2>/dev/null; mkdir -p ci-logs/$n/restore-test; cp "$d"/restore-test/*.log ci-logs/$n/restore-test/ 2>/dev/null; done; true'
+          sudo cp /etc/mongod.conf ci-logs/mongod.conf 2>/dev/null || true
+          sudo cp /etc/mongot/mongot.yml ci-logs/mongot.yml 2>/dev/null || true
+          sudo bash -c 'ls -la /opt/mongot/current/ 2>&1' > ci-logs/mongot-install-listing.txt || true
           sudo cp /var/log/mongodb/mongod.log ci-logs/ 2>/dev/null || true
           sudo journalctl -u mongot --no-pager > ci-logs/mongot.journal.log 2>/dev/null || true
           sudo journalctl -u mongod --no-pager > ci-logs/mongod.journal.log 2>/dev/null || true
